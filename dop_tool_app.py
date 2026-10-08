@@ -59,33 +59,87 @@ def show_model_summary():
         c.metric(a,b)
 
 def _section_svg(section_type, dims):
-    W,H=420,300; pad=45; sx,sy=W-2*pad,H-2*pad
-    def rect(x,y,w,h,fill="#d9dde3",stroke="#111827",sw=3):
-        return f"<rect x='{x:.1f}' y='{y:.1f}' width='{w:.1f}' height='{h:.1f}' fill='{fill}' stroke='{stroke}' stroke-width='{sw}'/>"
-    parts=[]
-    if section_type=="I/H":
-        b,h,tf,tw=[float(dims[k]) for k in ("b","h","tf","tw")]
-        sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh,bt,wt=b*sc,h*sc,tf*sc,tw*sc; x0=(W-bw)/2; y0=(H-bh)/2
-        parts=[rect(x0,y0,bw,bt),rect(x0,y0+bh-bt,bw,bt),rect(x0+(bw-wt)/2,y0+bt,wt,bh-2*bt)]
-        A=2*b*tf+(h-2*tf)*tw; I=b*h**3/12-(b-tw)*(h-2*tf)**3/12
-        txt=f"I/H: h={h*1000:.0f} mm, b={b*1000:.0f} mm, tw={tw*1000:.0f} mm, tf={tf*1000:.0f} mm"
-    elif section_type=="Hộp chữ nhật rỗng":
-        b,h,t=[float(dims[k]) for k in ("b","h","t")]; sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh=b*sc,h*sc; x0=(W-bw)/2; y0=(H-bh)/2; ti=t*sc
-        parts=[rect(x0,y0,bw,bh),rect(x0+ti,y0+ti,bw-2*ti,bh-2*ti,fill="#ffffff",stroke="#111827",sw=2)]
-        A=b*h-(b-2*t)*(h-2*t); I=(b*h**3-(b-2*t)*(h-2*t)**3)/12; txt=f"Box: h={h*1000:.0f} mm, b={b*1000:.0f} mm, t={t*1000:.0f} mm"
-    elif section_type=="Ống tròn":
+    """Create a responsive SVG section preview that always fits inside its frame."""
+    W, H = 520, 360
+    # Keep a generous safety margin so thick strokes/text can never be clipped.
+    left, right, top, bottom = 55, 55, 55, 58
+    sx, sy = W - left - right, H - top - bottom
+
+    def rect(x, y, w, h, fill="#d9dde3", stroke="#111827", sw=3):
+        return (f"<rect x='{x:.2f}' y='{y:.2f}' width='{max(w,0):.2f}' "
+                f"height='{max(h,0):.2f}' fill='{fill}' stroke='{stroke}' "
+                f"stroke-width='{sw}' vector-effect='non-scaling-stroke'/>")
+
+    parts = []
+    if section_type == "I/H":
+        b, h, tf, tw = [float(dims[k]) for k in ("b", "h", "tf", "tw")]
+        # Limit the scale by BOTH dimensions and leave room around the section.
+        sc = min(sx / max(b, 1e-12), sy / max(h, 1e-12)) * 0.82
+        bw, bh, bt, wt = b*sc, h*sc, tf*sc, tw*sc
+        x0, y0 = W/2 - bw/2, top + sy/2 - bh/2
+        parts = [
+            rect(x0, y0, bw, bt),
+            rect(x0, y0 + bh - bt, bw, bt),
+            rect(x0 + (bw-wt)/2, y0 + bt, wt, max(bh-2*bt, 0)),
+        ]
+        A = 2*b*tf + (h-2*tf)*tw
+        I = b*h**3/12 - (b-tw)*max(h-2*tf, 0)**3/12
+        txt = f"I/H: h={h*1000:.0f} mm, b={b*1000:.0f} mm, tw={tw*1000:.0f} mm, tf={tf*1000:.0f} mm"
+
+    elif section_type == "Hộp chữ nhật rỗng":
+        b, h, t = [float(dims[k]) for k in ("b", "h", "t")]
+        sc = min(sx / max(b, 1e-12), sy / max(h, 1e-12)) * 0.82
+        bw, bh, ti = b*sc, h*sc, t*sc
+        x0, y0 = W/2 - bw/2, top + sy/2 - bh/2
+        parts = [
+            rect(x0, y0, bw, bh),
+            rect(x0+ti, y0+ti, max(bw-2*ti, 0), max(bh-2*ti, 0),
+                 fill="#ffffff", stroke="#111827", sw=2),
+        ]
+        A = b*h - max(b-2*t, 0)*max(h-2*t, 0)
+        I = (b*h**3 - max(b-2*t, 0)*max(h-2*t, 0)**3)/12
+        txt = f"Box: h={h*1000:.0f} mm, b={b*1000:.0f} mm, t={t*1000:.0f} mm"
+
+    elif section_type == "Ống tròn":
         import math
-        d,t=[float(dims[k]) for k in ("d","t")]; outer=min(sx,sy)*0.72; inner=outer*(max(d-2*t,1e-9)/max(d,1e-9)); cx,cy=W/2,H/2
-        parts=[f"<circle cx='{cx}' cy='{cy}' r='{outer/2}' fill='#d9dde3' stroke='#111827' stroke-width='3'/>",f"<circle cx='{cx}' cy='{cy}' r='{inner/2}' fill='#ffffff' stroke='#111827' stroke-width='2'/>"]
-        A=math.pi*(d*d-(d-2*t)**2)/4; I=math.pi*(d**4-(d-2*t)**4)/64; txt=f"Ống tròn: D={d*1000:.0f} mm, t={t*1000:.0f} mm"
+        d, t = [float(dims[k]) for k in ("d", "t")]
+        t = min(t, d/2 * 0.98)
+        diameter_px = min(sx, sy) * 0.72
+        outer_r = diameter_px/2
+        inner_ratio = max(d-2*t, 0) / max(d, 1e-12)
+        inner_r = outer_r * inner_ratio
+        cx, cy = W/2, top + sy/2
+        parts = [
+            f"<circle cx='{cx:.2f}' cy='{cy:.2f}' r='{outer_r:.2f}' fill='#d9dde3' stroke='#111827' stroke-width='3' vector-effect='non-scaling-stroke'/>",
+            f"<circle cx='{cx:.2f}' cy='{cy:.2f}' r='{inner_r:.2f}' fill='#ffffff' stroke='#111827' stroke-width='2' vector-effect='non-scaling-stroke'/>",
+        ]
+        A = math.pi*(d*d-(d-2*t)**2)/4
+        I = math.pi*(d**4-(d-2*t)**4)/64
+        txt = f"Ống tròn: D={d*1000:.0f} mm, t={t*1000:.0f} mm"
+
     else:
-        b,h=[float(dims[k]) for k in ("b","h")]; sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh=b*sc,h*sc; x0=(W-bw)/2; y0=(H-bh)/2
-        parts=[rect(x0,y0,bw,bh)]; A=b*h; I=b*h**3/12; txt=f"Chữ nhật: b={b*1000:.0f} mm, h={h*1000:.0f} mm"
-    svg=(f"<svg xmlns='http://www.w3.org/2000/svg' width='100%' viewBox='0 0 {W} {H}' style='background:#fff;border:1px solid #c7ccd4;border-radius:10px'>"
-         + ''.join(parts)
-         + f"<text x='{W/2}' y='24' text-anchor='middle' font-family='Arial' font-size='14' font-weight='700' fill='#111827'>MẶT CẮT TIẾT DIỆN</text>"
-         + f"<text x='{W/2}' y='{H-10}' text-anchor='middle' font-family='Arial' font-size='12' fill='#374151'>{txt} · A={A*1e4:.2f} cm² · I={I*1e8:.2f} cm⁴</text></svg>")
-    return svg,A,I
+        b, h = [float(dims[k]) for k in ("b", "h")]
+        sc = min(sx / max(b, 1e-12), sy / max(h, 1e-12)) * 0.82
+        bw, bh = b*sc, h*sc
+        x0, y0 = W/2 - bw/2, top + sy/2 - bh/2
+        parts = [rect(x0, y0, bw, bh)]
+        A = b*h
+        I = b*h**3/12
+        txt = f"Chữ nhật: b={b*1000:.0f} mm, h={h*1000:.0f} mm"
+
+    svg = (
+        f"<div style='width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;'>"
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='100%' height='100%' "
+        f"viewBox='0 0 {W} {H}' preserveAspectRatio='xMidYMid meet' "
+        f"style='display:block;max-width:100%;max-height:100%;background:#fff;"
+        f"border:1px solid #c7ccd4;border-radius:10px;box-sizing:border-box;'>"
+        f"<rect x='0' y='0' width='{W}' height='{H}' rx='10' fill='#fff'/>"
+        + ''.join(parts)
+        + f"<text x='{W/2}' y='28' text-anchor='middle' font-family='Arial,sans-serif' font-size='15' font-weight='700' fill='#111827'>MẶT CẮT TIẾT DIỆN</text>"
+        + f"<text x='{W/2}' y='{H-18}' text-anchor='middle' font-family='Arial,sans-serif' font-size='12' fill='#374151'>{txt} · A={A*1e4:.2f} cm² · I={I*1e8:.2f} cm⁴</text>"
+        + "</svg></div>"
+    )
+    return svg, A, I
 
 def render_section_panel():
     st.markdown("### 🧱 Mặt cắt tiết diện")
@@ -102,7 +156,7 @@ def render_section_panel():
         else:
             b=st.number_input("b (mm)",20.0,1000.0,200.0,5.0,key="dop_rect_b")/1000; h=st.number_input("h (mm)",20.0,1500.0,300.0,5.0,key="dop_rect_h")/1000; dims={"b":b,"h":h}
     with c2:
-        svg,A,I=_section_svg(typ,dims); components.html(svg,height=320); st.write(f"**A = {A:.6g} m²** · **I = {I:.6g} m⁴**")
+        svg,A,I=_section_svg(typ,dims); components.html(svg, height=390, scrolling=False); st.write(f"**A = {A:.6g} m²** · **I = {I:.6g} m⁴**")
 
 
 def render_optimizer():
