@@ -4,6 +4,7 @@ import io, json, math
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 
 import beam_analysis_ui as ui
@@ -57,6 +58,53 @@ def show_model_summary():
     for c,(a,b) in zip(cols,vals):
         c.metric(a,b)
 
+def _section_svg(section_type, dims):
+    W,H=420,300; pad=45; sx,sy=W-2*pad,H-2*pad
+    def rect(x,y,w,h,fill="#d9dde3",stroke="#111827",sw=3):
+        return f"<rect x='{x:.1f}' y='{y:.1f}' width='{w:.1f}' height='{h:.1f}' fill='{fill}' stroke='{stroke}' stroke-width='{sw}'/>"
+    parts=[]
+    if section_type=="I/H":
+        b,h,tf,tw=[float(dims[k]) for k in ("b","h","tf","tw")]
+        sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh,bt,wt=b*sc,h*sc,tf*sc,tw*sc; x0=(W-bw)/2; y0=(H-bh)/2
+        parts=[rect(x0,y0,bw,bt),rect(x0,y0+bh-bt,bw,bt),rect(x0+(bw-wt)/2,y0+bt,wt,bh-2*bt)]
+        A=2*b*tf+(h-2*tf)*tw; I=b*h**3/12-(b-tw)*(h-2*tf)**3/12
+        txt=f"I/H: h={h*1000:.0f} mm, b={b*1000:.0f} mm, tw={tw*1000:.0f} mm, tf={tf*1000:.0f} mm"
+    elif section_type=="Hộp chữ nhật rỗng":
+        b,h,t=[float(dims[k]) for k in ("b","h","t")]; sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh=b*sc,h*sc; x0=(W-bw)/2; y0=(H-bh)/2; ti=t*sc
+        parts=[rect(x0,y0,bw,bh),rect(x0+ti,y0+ti,bw-2*ti,bh-2*ti,fill="#ffffff",stroke="#111827",sw=2)]
+        A=b*h-(b-2*t)*(h-2*t); I=(b*h**3-(b-2*t)*(h-2*t)**3)/12; txt=f"Box: h={h*1000:.0f} mm, b={b*1000:.0f} mm, t={t*1000:.0f} mm"
+    elif section_type=="Ống tròn":
+        import math
+        d,t=[float(dims[k]) for k in ("d","t")]; outer=min(sx,sy)*0.72; inner=outer*(max(d-2*t,1e-9)/max(d,1e-9)); cx,cy=W/2,H/2
+        parts=[f"<circle cx='{cx}' cy='{cy}' r='{outer/2}' fill='#d9dde3' stroke='#111827' stroke-width='3'/>",f"<circle cx='{cx}' cy='{cy}' r='{inner/2}' fill='#ffffff' stroke='#111827' stroke-width='2'/>"]
+        A=math.pi*(d*d-(d-2*t)**2)/4; I=math.pi*(d**4-(d-2*t)**4)/64; txt=f"Ống tròn: D={d*1000:.0f} mm, t={t*1000:.0f} mm"
+    else:
+        b,h=[float(dims[k]) for k in ("b","h")]; sc=min(sx/max(b,1e-9),sy/max(h,1e-9)); bw,bh=b*sc,h*sc; x0=(W-bw)/2; y0=(H-bh)/2
+        parts=[rect(x0,y0,bw,bh)]; A=b*h; I=b*h**3/12; txt=f"Chữ nhật: b={b*1000:.0f} mm, h={h*1000:.0f} mm"
+    svg=(f"<svg xmlns='http://www.w3.org/2000/svg' width='100%' viewBox='0 0 {W} {H}' style='background:#fff;border:1px solid #c7ccd4;border-radius:10px'>"
+         + ''.join(parts)
+         + f"<text x='{W/2}' y='24' text-anchor='middle' font-family='Arial' font-size='14' font-weight='700' fill='#111827'>MẶT CẮT TIẾT DIỆN</text>"
+         + f"<text x='{W/2}' y='{H-10}' text-anchor='middle' font-family='Arial' font-size='12' fill='#374151'>{txt} · A={A*1e4:.2f} cm² · I={I*1e8:.2f} cm⁴</text></svg>")
+    return svg,A,I
+
+def render_section_panel():
+    st.markdown("### 🧱 Mặt cắt tiết diện")
+    st.caption("Hiển thị hình học tiết diện trực tiếp trong giao diện; A và I được tính từ kích thước thực.")
+    c1,c2=st.columns([1,1.25])
+    with c1:
+        typ=st.selectbox("Loại tiết diện",["I/H","Hộp chữ nhật rỗng","Ống tròn","Chữ nhật đặc"],key="dop_sec_type")
+        if typ=="I/H":
+            b=st.number_input("b (mm)",50.0,1000.0,200.0,5.0,key="dop_sec_b")/1000; h=st.number_input("h (mm)",50.0,1500.0,300.0,5.0,key="dop_sec_h")/1000; tf=st.number_input("tf (mm)",2.0,100.0,10.0,1.0,key="dop_sec_tf")/1000; tw=st.number_input("tw (mm)",2.0,80.0,8.0,1.0,key="dop_sec_tw")/1000; dims={"b":b,"h":h,"tf":tf,"tw":tw}
+        elif typ=="Hộp chữ nhật rỗng":
+            b=st.number_input("b (mm)",50.0,1000.0,200.0,5.0,key="dop_box_b")/1000; h=st.number_input("h (mm)",50.0,1500.0,300.0,5.0,key="dop_box_h")/1000; t=st.number_input("t (mm)",2.0,80.0,8.0,1.0,key="dop_box_t")/1000; dims={"b":b,"h":h,"t":t}
+        elif typ=="Ống tròn":
+            d=st.number_input("D (mm)",20.0,1000.0,200.0,5.0,key="dop_pipe_d")/1000; t=st.number_input("t (mm)",1.0,80.0,8.0,1.0,key="dop_pipe_t")/1000; dims={"d":d,"t":t}
+        else:
+            b=st.number_input("b (mm)",20.0,1000.0,200.0,5.0,key="dop_rect_b")/1000; h=st.number_input("h (mm)",20.0,1500.0,300.0,5.0,key="dop_rect_h")/1000; dims={"b":b,"h":h}
+    with c2:
+        svg,A,I=_section_svg(typ,dims); components.html(svg,height=320); st.write(f"**A = {A:.6g} m²** · **I = {I:.6g} m⁴**")
+
+
 def render_optimizer():
     st.subheader("🧮 Tối ưu tiết diện bằng biến phân + FEM")
     nodes,elements,supports,loads = _model_from_state()
@@ -75,19 +123,29 @@ def render_optimizer():
     with c3: Amin = st.number_input("Amin (mm²)", 1.0, 1e6, 100.0, 10.0)
     with c4: Amax = st.number_input("Amax (mm²)", 100.0, 1e7, 200000.0, 100.0)
 
+    sw=st.checkbox("⚖️ Tính tự trọng của các thanh", value=True, key="dop_self_weight")
     settings=OptimizationSettings(
         sigma_allow=sigma*1000, disp_allow=dlim/1000,
         A_min=Amin/1e6, A_max=Amax/1e6,
-        I_min=1e-8, I_max=5e-2
+        I_min=1e-8, I_max=5e-2,
+        include_self_weight=sw,
     )
     st.session_state["dop_settings"] = settings
     st.session_state["dop_disp_allow"] = settings.disp_allow
 
+    st.session_state["dop_include_self_weight"] = sw
+    render_section_panel()
+
     st.markdown("### 1. Kết quả FEM đầu vào")
     show_model_summary()
-    st.write(f"**Chuyển vị lớn nhất hiện tại:** {max_displacement(r)*1000:.4f} mm")
+    if sw:
+        r_base = analyze(nodes,elements,supports,loads,settings,include_self_weight=True)
+        st.info("FEM đầu vào cho tối ưu đã được chạy lại với **tự trọng phụ thuộc A hiện tại**.")
+    else:
+        r_base = r
+    st.write(f"**Chuyển vị lớn nhất hiện tại:** {max_displacement(r_base)*1000:.4f} mm")
 
-    env=force_envelopes(r)
+    env=force_envelopes(r_base)
     df=pd.DataFrame({
         "Thanh":[q["elem_idx"] for q in env],
         "Nmax (kN)":[q["Nmax"] for q in env],
@@ -98,7 +156,7 @@ def render_optimizer():
     st.dataframe(df,use_container_width=True,hide_index=True)
 
     st.markdown("### 2. Ứng viên biến phân")
-    cand,meta=variational_frame_candidate(r,elements,settings)
+    cand,meta=variational_frame_candidate(r_base,elements,settings)
     cdf=pd.DataFrame({
         "Thanh":range(len(cand)),
         "A*(x) quy đổi (m²)":[x[0] for x in cand],
@@ -126,6 +184,8 @@ def render_optimizer():
         c.metric("Chuyển vị sau",f"{out['d_final']*1000:.4f} mm")
         if out["success"]: st.success(out["message"])
         else: st.warning(out["message"])
+        if out.get("self_weight_included"):
+            st.success("Đã **phân tích lại FEM sau tối ưu** với A mới và tự trọng mới; N, M và chuyển vị cuối cùng đã được cập nhật.")
 
         rdf=pd.DataFrame({
             "Thanh":range(len(out["A_final"])),

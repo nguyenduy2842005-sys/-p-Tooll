@@ -62,3 +62,9 @@ A*(x) = max(|N(x)|/σ_allow, |N(x)| sqrt(λ/E)).
 - Sensitivity FEM: dU/dp = -K^-1(dK/dp)U.
 - Tối ưu toàn khung với biến thiết kế liên tục theo từng phần tử/đoạn.
 - Chuyển nghiệm liên tục sang tiết diện thép thương mại.
+
+## v4 update
+- Tự trọng thanh được tính theo `q_g = rho*g*A/1000` và cập nhật lại mỗi lần FEM đánh giá một phương án tiết diện.
+- Sau khi tối ưu, FEM cuối được chạy lại với A mới nên N, M và chuyển vị cuối không lấy từ trường nội lực cũ.
+- Bổ sung khung xem mặt cắt I/H, hộp chữ nhật rỗng, ống tròn và chữ nhật trong giao diện tối ưu.
+- Lưu ý: phiên bản hiện tại vẫn dùng A và I như hai biến thiết kế độc lập; khung mặt cắt là bộ xem hình học. Bước tiếp theo nên ràng buộc A-I theo một họ tiết diện thực (I/H, hộp, ống...) khi tối ưu kích thước.

@@ -21,6 +21,45 @@ class OptimizationSettings:
     target_utilization: float = 0.98
     optimize_A: bool = True
     optimize_I: bool = True
+    include_self_weight: bool = True
+
+
+def _self_weight_point_loads(nodes, elements, settings: OptimizationSettings):
+    """Equivalent nodal loads of member self-weight for the 2D frame.
+
+    qg = rho*g*A/1000 gives kN/m. Gravity acts in global -Y.
+    The load is converted to the local frame and integrated consistently,
+    so the optimizer sees the effect of changing A on both stiffness and
+    structural self-weight.
+    """
+    out = []
+    g = 9.81
+    for e in elements:
+        i, j = int(e["i"]), int(e["j"])
+        xi, yi = float(nodes[i]["x"]), float(nodes[i]["y"])
+        xj, yj = float(nodes[j]["x"]), float(nodes[j]["y"])
+        dx, dy = xj-xi, yj-yi
+        L = float(np.hypot(dx, dy))
+        if L <= 1e-12:
+            continue
+        c, ss = dx/L, dy/L
+        qg = -settings.rho * g * float(e.get("A", 0.0)) / 1000.0  # kN/m, global Y
+        qx = ss * qg
+        qy = c * qg
+        # consistent nodal loads in local [u,v,rz,u,v,rz]
+        fl = np.array([
+            qx*L/2, qy*L/2, qy*L**2/12,
+            qx*L/2, qy*L/2, -qy*L**2/12
+        ])
+        T = np.zeros((6,6))
+        T[0,0]=c; T[0,1]=ss; T[1,0]=-ss; T[1,1]=c; T[2,2]=1
+        T[3,3]=c; T[3,4]=ss; T[4,3]=-ss; T[4,4]=c; T[5,5]=1
+        fg = T.T @ fl
+        out.extend([
+            {"node": i, "Fx": float(fg[0]), "Fy": float(fg[1]), "Mz": float(fg[2])},
+            {"node": j, "Fx": float(fg[3]), "Fy": float(fg[4]), "Mz": float(fg[5])},
+        ])
+    return out
 
 
 def frame_input(nodes, elements, supports, loads) -> PlaneFrameInput:
@@ -36,8 +75,16 @@ def frame_input(nodes, elements, supports, loads) -> PlaneFrameInput:
     return PlaneFrameInput(nodes=ns, elements=es, supports=ss, point_loads=ls)
 
 
-def analyze(nodes, elements, supports, loads):
-    return solve_plane_frame(frame_input(nodes, elements, supports, loads))
+def analyze(nodes, elements, supports, loads, settings: OptimizationSettings | None = None, include_self_weight: bool = False):
+    """Run FEM. When requested, member self-weight is rebuilt from the CURRENT A.
+
+    This is intentionally done every time the optimizer changes A, because
+    self-weight is a design-dependent load and therefore changes N, M and u.
+    """
+    all_loads = list(loads)
+    if include_self_weight and settings is not None:
+        all_loads.extend(_self_weight_point_loads(nodes, elements, settings))
+    return solve_plane_frame(frame_input(nodes, elements, supports, all_loads))
 
 
 def max_displacement(result) -> float:
@@ -183,7 +230,8 @@ def finite_design_optimize(nodes, elements, supports, loads, settings: Optimizat
     Stress constraint: |N|/A + |M|/W is represented conservatively by
     separate axial and bending utilization proxies.
     """
-    base_result = analyze(nodes, elements, supports, loads)
+    # Baseline FEM includes member self-weight from the current A.
+    base_result = analyze(nodes, elements, supports, loads, settings, include_self_weight=settings.include_self_weight)
     env = force_envelopes(base_result)
     d0 = max_displacement(base_result)
 
@@ -221,7 +269,7 @@ def finite_design_optimize(nodes, elements, supports, loads, settings: Optimizat
         A, I = unpack(x)
         ee = _build_result_with_design(elements, A, I)
         try:
-            r = analyze(nodes, ee, supports, loads)
+            r = analyze(nodes, ee, supports, loads, settings, include_self_weight=settings.include_self_weight)
             d = max_displacement(r)
         except Exception:
             return 1e9, np.full(n, 1e9), np.full(n, 1e9), None
@@ -249,7 +297,9 @@ def finite_design_optimize(nodes, elements, supports, loads, settings: Optimizat
 
     Aopt, Iopt = unpack(res.x)
     opt_elements = _build_result_with_design(elements, Aopt, Iopt)
-    opt_result = analyze(nodes, opt_elements, supports, loads)
+    # FINAL FEM RE-ANALYSIS: the optimized A changes self-weight, therefore
+    # the final internal forces/displacements must be recalculated.
+    opt_result = analyze(nodes, opt_elements, supports, loads, settings, include_self_weight=settings.include_self_weight)
     dopt, Nu, Mu, _ = metrics(res.x)
 
     return {
@@ -270,6 +320,7 @@ def finite_design_optimize(nodes, elements, supports, loads, settings: Optimizat
         "variational_meta": meta,
         "opt_elements": opt_elements,
         "scipy_result": res,
+        "self_weight_included": True,
     }
 
 
@@ -292,7 +343,7 @@ def kkt_verify_design(nodes, elements, supports, loads, settings, result):
     def constraints_vec(xv):
         A, I = xv[0::2], xv[1::2]
         ee = _build_result_with_design(elements, A, I)
-        rr = analyze(nodes, ee, supports, loads)
+        rr = analyze(nodes, ee, supports, loads, settings, include_self_weight=settings.include_self_weight)
         d = max_displacement(rr)
         env = force_envelopes(rr)
         Nu = np.array([q["Nmax"]/max(a*settings.sigma_allow,1e-18) for q,a in zip(env,A)])
