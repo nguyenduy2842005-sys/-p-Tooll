@@ -1,0 +1,4589 @@
+"""
+web_app_v2.py — Beam Analysis Suite (Đã sửa triệt để lỗi thụt dòng IndentationError)
+Tabs:
+  1. Single Beam     — giữ nguyên logic gốc
+  2. Continuous Beam — FEM Euler-Bernoulli
+  3. Plane Frame     — FEM 2D khung phẳng
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import tempfile
+import zipfile
+from typing import Iterable
+from xml.sax.saxutils import escape as _xml_escape
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+
+from beam_core import BeamInput, BeamResult, solve_beam
+from fem_core import (
+    SpanDef, SupportDef, ContinuousBeamInput, ContinuousBeamResult,
+    solve_continuous_beam,
+    FrameNode, FrameElement, FrameSupport, FramePointLoad,
+    PlaneFrameInput, PlaneFrameResult, FrameElementResult,
+    solve_plane_frame,
+    build_docx_bytes,
+)
+
+# --- Hỗ trợ xuất ảnh chất lượng cao ---
+try:
+    import kaleido
+    KALEIDO_AVAILABLE = True
+except ImportError:
+    KALEIDO_AVAILABLE = False
+@st.cache_resource
+def get_kaleido_chrome():
+    try:
+        kaleido.get_chrome_sync()
+        return True
+    except:
+        return False
+
+def ensure_kaleido_chrome() -> bool:
+    return KALEIDO_AVAILABLE and get_kaleido_chrome()
+def create_placeholder_image(text: str) -> bytes:
+    """Tạo ảnh PNG với thông báo lỗi dùng Matplotlib."""
+    import matplotlib.pyplot as plt
+    import io
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.text(0.5, 0.5, f"⚠️ Không thể hiển thị biểu đồ:\n{text}",
+            ha='center', va='center', fontsize=14, transform=ax.transAxes)
+    ax.set_axis_off()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=200, bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return buf.getvalue()
+# ══════════════════════════════════════════════════════
+#  GLOBAL CONSTANTS & SAFE ADAPTIVE THEME
+# ══════════════════════════════════════════════════════
+PLOT_HEIGHT = 315
+
+COLOR_SFD   = "#0b5fff"
+COLOR_BMD   = "#ff2b2b"
+COLOR_ELAST = "#ff8800"
+COLOR_AXIAL = "#9b27af"
+COLOR_BEAM  = "#7a7f85"
+COLOR_SUP   = "#ef1d14"
+
+def _padded_range(values: np.ndarray, pad_frac: float = 0.18, min_span: float = 1.0) -> tuple[float, float]:
+    """Tính khoảng [min,max] có đệm biên hợp lý cho trục y, dựa trên dữ liệu thật.
+    Đảm bảo trục được KHÓA Ở MỘT TỶ LỆ CỐ ĐỊNH (không tự ý co giãn theo từng điểm hover),
+    nhưng vẫn hiển thị trọn vẹn toàn bộ biểu đồ."""
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    span = vmax - vmin
+    if span < min_span:
+        center = (vmax + vmin) / 2
+        vmin, vmax = center - min_span / 2, center + min_span / 2
+        span = vmax - vmin
+    pad = span * pad_frac
+    return (vmin - pad, vmax + pad)
+
+
+def base_figure(title, length, y_title="", reverse_y=None):
+    margin_x = max(length * 0.06, 0.5)
+
+    fig = go.Figure()
+
+    # Tự động nhận diện biểu đồ mô-men qua tiêu đề nếu không truyền tường minh reverse_y
+    if reverse_y is None:
+        title_lower = title.lower()
+        reverse_y = any(kw in title_lower for kw in ["mô-men", "momen", "moment", "bmd"])
+
+    # Range mặc định của bạn gốc là [-1.5, 1.2] (vmin = -1.5, vmax = 1.2)
+    if reverse_y:
+        y_range_config = [1.2, -1.5]  # [vmax, vmin] -> Ép trục Y đảo ngược cố định (Dương hướng xuống)
+    else:
+        y_range_config = [-1.5, 1.2]  # [vmin, vmax] -> Trục Y xuôi thông thường (Dương hướng lên)
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{title}</b>",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=14)
+        ),
+        height=315,
+        margin=dict(l=55, r=20, t=60, b=75),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=dict(
+            title="x (m)",
+            range=[-margin_x, length + margin_x],
+            zeroline=True,
+            mirror=True,
+            showgrid=True,
+            linecolor="gray",
+            gridcolor="rgba(128,128,128,0.2)"
+        ),
+        yaxis=dict(
+            title=y_title,
+            range=y_range_config,  # <--- Áp dụng cấu hình range đã chuẩn hóa hình học
+            zeroline=True,
+            mirror=True,
+            showgrid=True,
+            linecolor="gray",
+            gridcolor="rgba(128,128,128,0.2)"
+        )
+    )
+    return fig
+
+
+def synced_figure(title, length, y_range=(-1.5, 1.2), y_title="", reverse_y=None):
+    margin_x = max(length * 0.06, 0.5)
+
+    fig = go.Figure()
+
+    # Tự động nhận diện biểu đồ mô-men qua tiêu đề nếu không truyền tường minh reverse_y
+    if reverse_y is None:
+        title_lower = title.lower()
+        reverse_y = any(kw in title_lower for kw in ["mô-men", "momen", "moment", "bmd"])
+
+    # Xử lý dải giá trị y_range dựa trên việc có đảo trục hay không
+    if y_range is not None:
+        vmin = min(y_range)
+        vmax = max(y_range)
+        if reverse_y:
+            actual_y_range = [vmax, vmin]  # Số lớn xếp trước số nhỏ -> Ép cả Web lẫn Kaleido lật ngược trục Y 100%
+        else:
+            actual_y_range = [vmin, vmax]  # Số nhỏ xếp trước số lớn -> Trục xuôi toán học thông thường
+    else:
+        actual_y_range = None
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{title}</b>",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=15)
+        ),
+        height=PLOT_HEIGHT,
+        margin=dict(l=55, r=25, t=60, b=65),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=dict(
+            title="x (m)",
+            range=[-margin_x, length + margin_x],
+            zeroline=True,
+            mirror=True,
+            scaleanchor=None
+        ),
+        yaxis=dict(
+            title=y_title,
+            range=actual_y_range,  # <--- Sử dụng range cấu hình đảo tường minh ở đây
+            zeroline=True,
+            mirror=True
+        )
+    )
+
+    fig.update_xaxes(
+        showgrid=True,
+        linecolor="gray",
+        gridcolor="rgba(128,128,128,0.2)"
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        linecolor="gray",
+        gridcolor="rgba(128,128,128,0.2)"
+    )
+    return fig
+
+def single_synced_plot(title, length, y_title=""):
+        return synced_figure(
+            title,
+            length,
+            y_range=(-1.5, 1.2),
+            y_title=y_title
+        )
+
+# ══════════════════════════════════════════════════════
+#  PAGE CONFIG & ADAPTIVE CSS
+# ══════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Beam Analysis ",
+    page_icon="🏗️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+def inject_css() -> None:
+    # Xác định trạng thái sidebar từ session_state
+    sidebar_open = st.session_state.get("sidebar_open", True)
+
+    # CSS ẩn/hiện sidebar dựa trên trạng thái
+    sidebar_css = """
+    section[data-testid="stSidebar"] {
+        display: block !important;
+        width: 21rem !important;
+        min-width: 21rem !important;
+        transition: all 0.25s ease;
+    }
+    """ if sidebar_open else """
+    section[data-testid="stSidebar"] {
+        display: none !important;
+        width: 0px !important;
+        min-width: 0px !important;
+    }
+    """
+
+    st.markdown(f"""
+    <style>
+    /* Ẩn các thành phần không cần thiết */
+    #MainMenu, footer, [data-testid="stToolbar"] {{
+        display: none !important;
+    }}
+
+    /* Sidebar toggle CSS */
+    {sidebar_css}
+
+    /* Layout */
+    .block-container {{
+        padding-top: 0.5rem;
+        padding-bottom: 1.5rem;
+        max-width: 1680px;
+    }}
+    .metric-strip {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin: 0.2rem 0 0.8rem;
+    }}
+    .metric-card {{
+        background: var(--background-color);
+        border: 1px solid var(--secondary-background-color);
+        border-radius: 6px;
+        padding: 10px 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }}
+    .metric-label {{
+        color: var(--text-color);
+        opacity: 0.7;
+        font-size: 0.78rem;
+        margin-bottom: 3px;
+    }}
+    .metric-value {{
+        color: var(--text-color);
+        font-weight: 700;
+        font-size: 1.08rem;
+    }}
+    div[data-testid="stVerticalBlockBorderWrapper"] {{
+        border-color: var(--secondary-background-color);
+    }}
+    .stPlotlyChart {{
+        border: 1px solid var(--secondary-background-color);
+        border-radius: 6px;
+        padding: 6px;
+        background-color: transparent !important;
+    }}
+    textarea {{
+        font-family: Consolas, "Courier New", monospace !important;
+    }}
+
+    /* Style nút hamburger trong header */
+    div[data-testid="stHorizontalBlock"] > div:first-child button {{
+        padding: 4px 10px;
+        font-size: 20px;
+        line-height: 1;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════
+#  SHARED HELPERS
+# ══════════════════════════════════════════════════════
+
+def clean_rows(df: pd.DataFrame, columns: Iterable[str]) -> list[tuple[float, ...]]:
+    rows: list[tuple[float, ...]] = []
+    for _, _row in df.iterrows():
+        values: list[float] = []
+        skip = False
+        for col in columns:
+            v = _row.get(col)
+            if v is None or pd.isna(v) or v == "":
+                skip = True; break
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                skip = True; break
+            if not math.isfinite(n):
+                skip = True; break
+            values.append(n)
+        if not skip:
+            rows.append(tuple(values))
+    return rows
+
+
+def safe_data_editor(
+    widget_key: str,
+    default_df: pd.DataFrame,
+    **editor_kwargs
+) -> pd.DataFrame:
+    """
+    Wrapper an toan cho st.data_editor.
+
+    FIX QUAN TRONG (loi nhap 2 lan / phai go lai nhieu lan moi nhan gia tri):
+    Nguyen nhan goc la kieu "double buffering" - moi lan rerun ham nay ghi
+    st.session_state[data_key] = edited_df (gia tri DA CHINH SUA) roi lai dua
+    chinh gia tri do lam `value` cho lan render ke tiep cua st.data_editor.
+    Vi Streamlit dinh danh moi dong theo vi tri/ID trong `value` truyen vao,
+    con "diff" (edited_rows/added_rows) cua widget lai duoc luu rieng theo
+    `key` va tinh tuong doi so voi `value` cua LAN RENDER TRUOC, viec doi
+    `value` lien tuc theo cach nay lam ID dong bi lech dan qua moi lan go,
+    nen o hien thi None va nguoi dung phai nhap lai - cang nhap nhieu o,
+    cang phai go lai nhieu lan (dung nhu mo ta: o thu 3 phai go 6 lan).
+
+    Cach fix: chi khoi tao `value` seed MOT LAN DUY NHAT (hoac khi bi reset
+    tuong minh). KHONG ghi de seed bang gia tri da edit sau moi lan render.
+    Streamlit tu dong luu va hop nhat cac thay doi cua nguoi dung thong qua
+    `key` cua widget qua cac lan rerun, nen khong can - va khong duoc - tu
+    tay ghi lai `value` moi lan.
+    """
+
+    data_key = f"{widget_key}__data"
+    ver_key = f"{widget_key}__ver"
+
+    if data_key not in st.session_state:
+        st.session_state[data_key] = default_df.copy()
+    if ver_key not in st.session_state:
+        st.session_state[ver_key] = 0
+
+    # Widget key thuc te co gan them so phien ban (version). Khi co chinh sua
+    # LAP TRINH (vd. panel "gan nhanh" ghi thang vao bang qua pf_set_table),
+    # so phien ban tang len -> Streamlit mount mot widget MOI hoan toan, tranh
+    # xung dot voi diff cu con luu trong widget cu (chinh la loai loi da fix
+    # o tren, neu tai su dung y het key cu voi value bi doi tu ben ngoai).
+    actual_key = f"{widget_key}_v{st.session_state[ver_key]}"
+
+    edited_df = st.data_editor(
+        st.session_state[data_key],
+        key=actual_key,
+        **editor_kwargs,
+    )
+
+    return edited_df
+
+
+def _safe_num(v, default: float = 0.0) -> float:
+    """Tra ve so thuc hop le; NaN/None/rong -> default (tranh loi 'NaN or 0' trong Python)."""
+    try:
+        if v is None or v == "" or pd.isna(v):
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def pf_set_table(widget_key: str, new_df: pd.DataFrame) -> None:
+    """Cap nhat mot bang cua safe_data_editor tu code (khong phai nguoi dung go tay).
+
+    Dung cho cac panel "gan nhanh" (chon tiet dien, gan UDL hang loat, ...).
+    Sau khi goi ham nay PHAI st.rerun() de widget duoc mount lai voi du lieu moi.
+    """
+    data_key = f"{widget_key}__data"
+    ver_key = f"{widget_key}__ver"
+    st.session_state[data_key] = new_df.copy()
+    st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
+
+
+# ══════════════════════════════════════════════════════
+#  COMPONENT: VẼ KHUNG PHẲNG BẰNG CHUỘT (kéo-thả tạo thanh)
+#  -> HTML được nhúng trực tiếp trong Python (không phụ thuộc GitHub/CDN/
+#     cache của bên thứ ba). Ghi ra file tạm lúc runtime rồi declare_component
+#     trỏ path= vào đó — luôn tồn tại, luôn đúng bản, không lo cache.
+# ══════════════════════════════════════════════════════
+_FRAME_CANVAS_HTML = r'''<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+    background: transparent;
+    color: #262730;
+  }
+  #root { width: 100%; }
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 6px 2px 8px 2px;
+  }
+  .btn {
+    border: 1px solid #d5d8dd; background: #ffffff; color: #262730;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+    user-select: none; white-space: nowrap;
+  }
+  .btn:hover { background: #f0f2f6; }
+  .btn.active { background: #1f77b4; color: #ffffff; border-color: #1f77b4; }
+  .btn.danger:hover { background: #ffe8e6; border-color: #ef1d14; }
+  .sep { width: 1px; height: 22px; background: #e2e5ea; margin: 0 4px; }
+  #canvasWrap {
+    width: 100%; border: 1px solid #e2e5ea; border-radius: 8px;
+    overflow: hidden; background: #fcfcfd; touch-action: none;
+  }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  .status {
+    display: flex; justify-content: space-between; flex-wrap: wrap;
+    font-size: 12px; color: #6b7280; padding: 6px 2px 0 2px; gap: 8px;
+  }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:4px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="toolbar">
+    <button class="btn active" data-mode="draw" id="btnDraw">✏️ Vẽ thanh</button>
+    <button class="btn" data-mode="support" id="btnSupport">🔒 Gối tựa</button>
+    <button class="btn" data-mode="move" id="btnMove">↔️ Di chuyển nút</button>
+    <button class="btn danger" data-mode="delete" id="btnDelete">🗑️ Xoá</button>
+    <div class="sep"></div>
+    <button class="btn" id="btnUndo">↩️ Undo</button>
+    <button class="btn" id="btnFit">🔍 Vừa khung hình</button>
+    <button class="btn" id="btnZoomOut">－</button>
+    <button class="btn" id="btnZoomIn">＋</button>
+    <div class="sep"></div>
+    <button class="btn danger" id="btnClear">🧹 Xoá tất cả</button>
+  </div>
+  <div id="canvasWrap"><canvas id="cv"></canvas></div>
+  <div class="status">
+    <div class="legend">
+      <span><span class="dot" style="background:#1f77b4"></span>Thanh / Nút</span>
+      <span><span class="dot" style="background:#ef1d14"></span>Gối tựa</span>
+      <span><span class="dot" style="background:#e67300"></span>Đang vẽ</span>
+    </div>
+    <div id="statusText">Chế độ: Vẽ thanh — 0 nút, 0 thanh</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("cv");
+  const ctx = canvas.getContext("2d");
+  const wrap = document.getElementById("canvasWrap");
+  const statusText = document.getElementById("statusText");
+
+  let CANVAS_HEIGHT = 520;
+  let cssW = 800, cssH = CANVAS_HEIGHT;
+  let scalePxPerM = 50;
+  let snap = 0.5;
+  let originPx = { x: 60, y: CANVAS_HEIGHT - 50 };
+
+  let state = { nodes: [], elements: [], supports: {} };
+  let history = [];
+  let mode = "draw";
+  let dragging = null;
+  let seeded = false;
+  let lastResetToken = null;
+
+  // ---------- coordinate transforms ----------
+  function toPx(w) { return { x: originPx.x + w.x * scalePxPerM, y: originPx.y - w.y * scalePxPerM }; }
+  function toWorld(p) { return { x: (p.x - originPx.x) / scalePxPerM, y: -(p.y - originPx.y) / scalePxPerM }; }
+  function r3(v) { return Math.round(v * 1000) / 1000; }
+  function snapWorld(w) { return { x: r3(Math.round(w.x / snap) * snap), y: r3(Math.round(w.y / snap) * snap) }; }
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+  function getPointer(e) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+    const cy = (e.touches && e.touches[0]) ? e.touches[0].clientY : e.clientY;
+    return { x: cx - rect.left, y: cy - rect.top };
+  }
+
+  // ---------- support type helpers ----------
+  const SUPPORT_ORDER = ["FIXED", "PIN", "ROLX", "ROLY"];
+  const SUPPORT_LABEL = { FIXED: "Ngàm", PIN: "Khớp", ROLX: "Di động ⊥Y", ROLY: "Di động ⊥X" };
+  function typeToBool(type) {
+    switch (type) {
+      case "FIXED": return { ux: true, uy: true, rz: true };
+      case "PIN": return { ux: true, uy: true, rz: false };
+      case "ROLX": return { ux: false, uy: true, rz: false };
+      case "ROLY": return { ux: true, uy: false, rz: false };
+      default: return null;
+    }
+  }
+  function boolToType(ux, uy, rz) {
+    if (ux && uy && rz) return "FIXED";
+    if (ux && uy && !rz) return "PIN";
+    if (!ux && uy) return "ROLX";
+    if (ux && !uy) return "ROLY";
+    return null;
+  }
+
+  // ---------- state helpers ----------
+  function pushHistory() {
+    history.push(JSON.parse(JSON.stringify(state)));
+    if (history.length > 60) history.shift();
+  }
+  function elementExists(a, b) {
+    return state.elements.some((e) => (e.i === a && e.j === b) || (e.i === b && e.j === a));
+  }
+  function findNodeNear(px, radius) {
+    let best = -1, bestD = radius;
+    state.nodes.forEach((n, idx) => {
+      const d = dist(toPx(n), px);
+      if (d < bestD) { bestD = d; best = idx; }
+    });
+    return best;
+  }
+  function pointSegDist(p, a, b) {
+    const abx = b.x - a.x, aby = b.y - a.y;
+    const denom = abx * abx + aby * aby || 1;
+    let t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / denom;
+    t = Math.max(0, Math.min(1, t));
+    const proj = { x: a.x + t * abx, y: a.y + t * aby };
+    return dist(p, proj);
+  }
+  function findElementNear(px, threshold) {
+    let best = -1, bestD = threshold;
+    state.elements.forEach((e, idx) => {
+      const a = state.nodes[e.i], b = state.nodes[e.j];
+      if (!a || !b) return;
+      const d = pointSegDist(px, toPx(a), toPx(b));
+      if (d < bestD) { bestD = d; best = idx; }
+    });
+    return best;
+  }
+  function findOrCreateNode(w) {
+    for (let i = 0; i < state.nodes.length; i++) {
+      const n = state.nodes[i];
+      if (Math.abs(n.x - w.x) < 1e-6 && Math.abs(n.y - w.y) < 1e-6) return i;
+    }
+    state.nodes.push({ x: w.x, y: w.y });
+    return state.nodes.length - 1;
+  }
+  function resolvePoint(px) {
+    const hit = findNodeNear(px, 10);
+    if (hit >= 0) return { world: { x: state.nodes[hit].x, y: state.nodes[hit].y }, idx: hit };
+    return { world: snapWorld(toWorld(px)), idx: null };
+  }
+
+  function commitMember(pStart, pEnd) {
+    if (dist(pStart, pEnd) < 4) return;
+    const rs = resolvePoint(pStart), re = resolvePoint(pEnd);
+    if (rs.idx != null && re.idx != null) {
+      if (rs.idx === re.idx) return;
+      if (elementExists(rs.idx, re.idx)) return;
+    }
+    pushHistory();
+    const iIdx = rs.idx != null ? rs.idx : findOrCreateNode(rs.world);
+    const jIdx = re.idx != null ? re.idx : findOrCreateNode(re.world);
+    state.elements.push({ i: iIdx, j: jIdx });
+    redraw(); sendValue();
+  }
+
+  function deleteNode(idx) {
+    pushHistory();
+    state.nodes.splice(idx, 1);
+    const remap = {};
+    let c = 0;
+    for (let k = 0; k < state.nodes.length + 1; k++) {
+      if (k === idx) continue;
+      remap[k] = c++;
+    }
+    state.elements = state.elements
+      .filter((e) => e.i !== idx && e.j !== idx)
+      .map((e) => ({ i: remap[e.i], j: remap[e.j] }));
+    const newSupports = {};
+    Object.entries(state.supports).forEach(([k, v]) => {
+      const ki = parseInt(k, 10);
+      if (ki === idx) return;
+      newSupports[remap[ki]] = v;
+    });
+    state.supports = newSupports;
+    redraw(); sendValue();
+  }
+  function deleteElement(idx) {
+    pushHistory();
+    state.elements.splice(idx, 1);
+    redraw(); sendValue();
+  }
+
+  function undo() {
+    if (!history.length) return;
+    state = history.pop();
+    redraw(); sendValue();
+  }
+  function clearAll() {
+    if (!confirm("Xoá toàn bộ khung đang vẽ trên canvas?")) return;
+    pushHistory();
+    state = { nodes: [], elements: [], supports: {} };
+    redraw(); sendValue();
+  }
+
+  // ---------- drawing ----------
+  function drawGrid() {
+    const c1 = toWorld({ x: 0, y: 0 });
+    const c2 = toWorld({ x: cssW, y: cssH });
+    const xMin = Math.floor(Math.min(c1.x, c2.x) / snap) * snap;
+    const xMax = Math.ceil(Math.max(c1.x, c2.x) / snap) * snap;
+    const yMin = Math.floor(Math.min(c1.y, c2.y) / snap) * snap;
+    const yMax = Math.ceil(Math.max(c1.y, c2.y) / snap) * snap;
+
+    ctx.lineWidth = 1;
+    for (let x = xMin; x <= xMax + 1e-9; x += snap) {
+      const isInt = Math.abs(Math.round(x) - x) < 1e-6;
+      ctx.strokeStyle = isInt ? "#dfe3e9" : "#eef1f5";
+      const p1 = toPx({ x: x, y: yMin }), p2 = toPx({ x: x, y: yMax });
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+    for (let y = yMin; y <= yMax + 1e-9; y += snap) {
+      const isInt = Math.abs(Math.round(y) - y) < 1e-6;
+      ctx.strokeStyle = isInt ? "#dfe3e9" : "#eef1f5";
+      const p1 = toPx({ x: xMin, y: y }), p2 = toPx({ x: xMax, y: y });
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+    ctx.strokeStyle = "#b9bfc9"; ctx.lineWidth = 1.5;
+    const ax1 = toPx({ x: xMin, y: 0 }), ax2 = toPx({ x: xMax, y: 0 });
+    ctx.beginPath(); ctx.moveTo(ax1.x, ax1.y); ctx.lineTo(ax2.x, ax2.y); ctx.stroke();
+    const ay1 = toPx({ x: 0, y: yMin }), ay2 = toPx({ x: 0, y: yMax });
+    ctx.beginPath(); ctx.moveTo(ay1.x, ay1.y); ctx.lineTo(ay2.x, ay2.y); ctx.stroke();
+  }
+
+  function drawElements() {
+    ctx.lineCap = "round";
+    state.elements.forEach((e, idx) => {
+      const a = state.nodes[e.i], b = state.nodes[e.j];
+      if (!a || !b) return;
+      const pa = toPx(a), pb = toPx(b);
+      ctx.strokeStyle = "#1f77b4"; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+      const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillRect(mx - 13, my - 8, 26, 14);
+      ctx.fillStyle = "#333"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("E" + idx, mx, my + 3);
+    });
+  }
+
+  function drawNodes() {
+    state.nodes.forEach((n, idx) => {
+      const p = toPx(n);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff"; ctx.fill();
+      ctx.strokeStyle = "#1f77b4"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = "#111"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("N" + idx, p.x, p.y - 11);
+    });
+  }
+
+  function drawSupports() {
+    Object.entries(state.supports).forEach(([k, type]) => {
+      const idx = parseInt(k, 10);
+      const n = state.nodes[idx];
+      if (!n) return;
+      const p = toPx(n);
+      const y0 = p.y + 12;
+      ctx.strokeStyle = "#ef1d14"; ctx.fillStyle = "#ef1d14"; ctx.lineWidth = 1.6;
+      if (type === "FIXED") {
+        ctx.beginPath(); ctx.moveTo(p.x - 10, y0); ctx.lineTo(p.x + 10, y0); ctx.stroke();
+        for (let i = -10; i <= 8; i += 4) {
+          ctx.beginPath(); ctx.moveTo(p.x + i, y0); ctx.lineTo(p.x + i - 4, y0 + 8); ctx.stroke();
+        }
+      } else if (type === "PIN") {
+        ctx.beginPath(); ctx.moveTo(p.x, p.y + 6); ctx.lineTo(p.x - 9, y0 + 10); ctx.lineTo(p.x + 9, y0 + 10); ctx.closePath(); ctx.fill();
+      } else {
+        ctx.beginPath(); ctx.moveTo(p.x, p.y + 6); ctx.lineTo(p.x - 9, y0 + 10); ctx.lineTo(p.x + 9, y0 + 10); ctx.closePath(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(p.x - 5, y0 + 13, 3, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(p.x + 5, y0 + 13, 3, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.font = "10px sans-serif"; ctx.textAlign = "left";
+      ctx.fillText(SUPPORT_LABEL[type], p.x + 14, y0 + 10);
+    });
+  }
+
+  function drawPreview() {
+    if (!dragging || dragging.type !== "draw") return;
+    const rs = resolvePoint(dragging.start);
+    const re = resolvePoint(dragging.cur);
+    const pa = toPx(rs.world), pb = toPx(re.world);
+    ctx.save();
+    ctx.setLineDash([7, 5]);
+    ctx.strokeStyle = "#e67300"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+    ctx.restore();
+    [rs, re].forEach((r) => {
+      const p = toPx(r.world);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = r.idx != null ? "#28a745" : "#e67300";
+      ctx.fill();
+    });
+  }
+
+  function redraw() {
+    ctx.clearRect(0, 0, cssW, cssH);
+    drawGrid();
+    drawElements();
+    drawSupports();
+    drawNodes();
+    drawPreview();
+    updateStatus();
+  }
+
+  const MODE_LABEL = { draw: "Vẽ thanh", support: "Gối tựa", move: "Di chuyển nút", delete: "Xoá" };
+  function updateStatus() {
+    statusText.textContent =
+      "Chế độ: " + MODE_LABEL[mode] + " — " + state.nodes.length + " nút, " +
+      state.elements.length + " thanh, " + Object.keys(state.supports).length + " gối tựa";
+  }
+
+  // ---------- value out ----------
+  function sendValue() {
+    const nodes = state.nodes.map((n) => ({ x: r3(n.x), y: r3(n.y) }));
+    const elements = state.elements.map((e) => ({ i: e.i, j: e.j }));
+    const supports = Object.entries(state.supports).map(([idx, type]) => {
+      const b = typeToBool(type);
+      return { node: parseInt(idx, 10), ux: b.ux, uy: b.uy, rz: b.rz };
+    });
+    const value = { nodes: nodes, elements: elements, supports: supports };
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: value, dataType: "json" }, "*");
+  }
+
+  // ---------- view controls ----------
+  function zoom(delta) {
+    scalePxPerM = Math.max(15, Math.min(160, scalePxPerM + delta));
+    redraw();
+  }
+  function fitView() {
+    if (!state.nodes.length) {
+      scalePxPerM = 50; originPx = { x: 60, y: cssH - 50 }; redraw(); return;
+    }
+    const xs = state.nodes.map((n) => n.x), ys = state.nodes.map((n) => n.y);
+    const xMin = Math.min(...xs, 0), xMax = Math.max(...xs, 1);
+    const yMin = Math.min(...ys, 0), yMax = Math.max(...ys, 1);
+    const spanX = Math.max(xMax - xMin, 1), spanY = Math.max(yMax - yMin, 1);
+    const availW = cssW - 110, availH = cssH - 100;
+    scalePxPerM = Math.max(15, Math.min(160, Math.min(availW / spanX, availH / spanY)));
+    originPx = { x: 70 - xMin * scalePxPerM, y: cssH - 60 + yMin * scalePxPerM };
+    redraw();
+  }
+
+  // ---------- mode / toolbar ----------
+  function setMode(m) {
+    mode = m; dragging = null;
+    document.querySelectorAll(".btn[data-mode]").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-mode") === m);
+    });
+    updateStatus();
+  }
+  document.getElementById("btnDraw").addEventListener("click", () => setMode("draw"));
+  document.getElementById("btnSupport").addEventListener("click", () => setMode("support"));
+  document.getElementById("btnMove").addEventListener("click", () => setMode("move"));
+  document.getElementById("btnDelete").addEventListener("click", () => setMode("delete"));
+  document.getElementById("btnUndo").addEventListener("click", undo);
+  document.getElementById("btnClear").addEventListener("click", clearAll);
+  document.getElementById("btnFit").addEventListener("click", fitView);
+  document.getElementById("btnZoomIn").addEventListener("click", () => zoom(10));
+  document.getElementById("btnZoomOut").addEventListener("click", () => zoom(-10));
+
+  // ---------- pointer / touch events ----------
+  function onDown(e) {
+    e.preventDefault();
+    const px = getPointer(e);
+    if (mode === "draw") {
+      dragging = { type: "draw", start: px, cur: px };
+    } else if (mode === "move") {
+      const hit = findNodeNear(px, 12);
+      if (hit >= 0) { pushHistory(); dragging = { type: "move", nodeIdx: hit, moved: false }; }
+    }
+    redraw();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    e.preventDefault();
+    const px = getPointer(e);
+    if (dragging.type === "draw") {
+      dragging.cur = px; redraw();
+    } else if (dragging.type === "move") {
+      const w = snapWorld(toWorld(px));
+      state.nodes[dragging.nodeIdx] = w;
+      dragging.moved = true;
+      redraw();
+    }
+  }
+  function onUp(e) {
+    const px = getPointer(e.changedTouches ? e.changedTouches[0] : e);
+    if (dragging) {
+      if (dragging.type === "draw") {
+        commitMember(dragging.start, px);
+      } else if (dragging.type === "move") {
+        if (dragging.moved) sendValue(); else history.pop();
+      }
+      dragging = null;
+      redraw();
+    } else {
+      handleClick(px);
+    }
+  }
+  function handleClick(px) {
+    if (mode === "support") {
+      const hit = findNodeNear(px, 12);
+      if (hit < 0) return;
+      pushHistory();
+      const cur = state.supports[hit];
+      let next;
+      if (cur === undefined) next = SUPPORT_ORDER[0];
+      else {
+        const i = SUPPORT_ORDER.indexOf(cur);
+        next = i + 1 < SUPPORT_ORDER.length ? SUPPORT_ORDER[i + 1] : undefined;
+      }
+      if (next === undefined) delete state.supports[hit];
+      else state.supports[hit] = next;
+      redraw(); sendValue();
+    } else if (mode === "delete") {
+      const hitNode = findNodeNear(px, 12);
+      if (hitNode >= 0) { deleteNode(hitNode); return; }
+      const hitEl = findElementNear(px, 9);
+      if (hitEl >= 0) { deleteElement(hitEl); return; }
+    }
+  }
+
+  canvas.addEventListener("mousedown", onDown);
+  canvas.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  canvas.addEventListener("touchstart", onDown, { passive: false });
+  canvas.addEventListener("touchmove", onMove, { passive: false });
+  canvas.addEventListener("touchend", onUp, { passive: false });
+
+  // ---------- sizing ----------
+  function resize() {
+    cssW = wrap.clientWidth || 800;
+    cssH = CANVAS_HEIGHT;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+    canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    originPx.y = cssH - 50;
+    redraw();
+    setFrameHeight();
+  }
+  function setFrameHeight() {
+    const total = document.body.scrollHeight + 12;
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: total }, "*");
+  }
+  window.addEventListener("resize", resize);
+
+  // ---------- Streamlit protocol ----------
+  function seedFromArgs(args) {
+    state = {
+      nodes: (args.nodes || []).map((n) => ({ x: +n.x, y: +n.y })),
+      elements: (args.elements || []).map((e) => ({ i: +e.i, j: +e.j })),
+      supports: {},
+    };
+    (args.supports || []).forEach((s) => {
+      const t = boolToType(!!s.ux, !!s.uy, !!s.rz);
+      if (t) state.supports[s.node] = t;
+    });
+    snap = args.snap || 0.5;
+    history = [];
+    CANVAS_HEIGHT = args.height || 520;
+  }
+
+  window.addEventListener("message", (event) => {
+    const d = event.data;
+    if (!d || !d.type) return;
+    if (d.type === "streamlit:render") {
+      const args = d.args || {};
+      if (!seeded || args.reset_token !== lastResetToken) {
+        seeded = true;
+        lastResetToken = args.reset_token;
+        seedFromArgs(args);
+        resize();
+        fitView();
+      }
+    }
+  });
+
+  resize();
+  window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+})();
+</script>
+</body>
+</html>
+'''
+
+@st.cache_resource
+def _get_frame_canvas_component():
+    _tmp_dir = tempfile.mkdtemp(prefix="frame_canvas_")
+    _tmp_path = os.path.join(_tmp_dir, "index.html")
+    with open(_tmp_path, "w", encoding="utf-8") as _f:
+        _f.write(_FRAME_CANVAS_HTML)
+    return components.declare_component("frame_canvas", path=_tmp_dir)
+
+_frame_canvas_component = _get_frame_canvas_component()
+
+
+def frame_canvas(nodes, elements, supports, snap: float = 0.5,
+                  reset_token: int = 0, height: int = 560, key: str | None = None):
+    """
+    Canvas HTML/JS cho phép người dùng KÉO CHUỘT từ điểm này sang điểm khác
+    để vẽ trực tiếp một thanh (element) của khung phẳng — tự bắt lưới / bắt
+    vào nút có sẵn gần đó, thay vì phải gõ tay toạ độ + chỉ số i, j vào bảng.
+
+    Trả về dict {"nodes": [...], "elements": [...], "supports": [...]} mỗi khi
+    người dùng thực hiện một thao tác làm thay đổi hình học (vẽ / xoá / di
+    chuyển nút / đổi loại gối), hoặc None nếu chưa có thay đổi nào.
+    """
+    return _frame_canvas_component(
+        nodes=nodes,
+        elements=elements,
+        supports=supports,
+        snap=snap,
+        reset_token=reset_token,
+        height=height,
+        key=key,
+        default=None,
+    )
+
+
+# ---- Thu vien tiet dien don gian (cong thuc hinh hoc chuan, khong tra bang) ----
+PF_SECTION_TYPES = ["Chữ nhật đặc", "Tròn đặc", "Ống tròn (rỗng)", "Hộp chữ nhật (rỗng)", "Nhập trực tiếp A, I"]
+
+PF_MATERIALS = {
+    "Thép (E ≈ 210000 MPa)": 210e6,      # kN/m^2 (210 GPa) — tham khảo, cần đối chiếu tiêu chuẩn dùng
+    "Bê tông B25 (E ≈ 30000 MPa)": 30e6,  # kN/m^2 — Eb theo TCVN 5574 chỉ mang tính tham khảo
+    "Bê tông B30 (E ≈ 32500 MPa)": 32.5e6,
+    "Nhôm (E ≈ 70000 MPa)": 70e6,
+    "Tùy chỉnh": None,
+}
+
+
+def pf_section_props(section_type: str, dims: dict) -> tuple[float, float] | None:
+    """Tính (A, I) theo công thức hình học tiêu chuẩn từ kích thước (đơn vị m).
+    Trả về None nếu kích thước không hợp lệ."""
+    try:
+        if section_type == "Chữ nhật đặc":
+            b, h = dims["b"], dims["h"]
+            if b <= 0 or h <= 0:
+                return None
+            return b * h, b * h ** 3 / 12.0
+        if section_type == "Tròn đặc":
+            d = dims["d"]
+            if d <= 0:
+                return None
+            return math.pi * d ** 2 / 4.0, math.pi * d ** 4 / 64.0
+        if section_type == "Ống tròn (rỗng)":
+            d_out, t = dims["d_out"], dims["t"]
+            d_in = d_out - 2 * t
+            if d_out <= 0 or t <= 0 or d_in <= 0:
+                return None
+            return (math.pi * (d_out ** 2 - d_in ** 2) / 4.0,
+                    math.pi * (d_out ** 4 - d_in ** 4) / 64.0)
+        if section_type == "Hộp chữ nhật (rỗng)":
+            b, h, t = dims["b"], dims["h"], dims["t"]
+            b_in, h_in = b - 2 * t, h - 2 * t
+            if b <= 0 or h <= 0 or t <= 0 or b_in <= 0 or h_in <= 0:
+                return None
+            return (b * h - b_in * h_in,
+                    (b * h ** 3 - b_in * h_in ** 3) / 12.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def validate_local_coordinate(
+    df: pd.DataFrame,
+    L_span: float,
+    x_column: str = "x_local (m)",
+):
+    """
+    Kiểm tra x_local của Point Load hoặc Point Moment.
+
+    Returns
+    -------
+    errors : list[str]
+    """
+
+    errors = []
+
+    if x_column not in df.columns:
+        return errors
+
+    for idx, row in df.iterrows():
+
+        value = row[x_column]
+
+        if pd.isna(value):
+            continue
+
+        try:
+            x = float(value)
+
+        except Exception:
+
+            errors.append(
+                f"Dòng {idx+1}: {x_column} không phải số."
+            )
+            continue
+
+        if x < 0:
+
+            errors.append(
+                f"Dòng {idx+1}: {x_column} = {x:.2f} m < 0."
+            )
+
+        elif x > L_span:
+
+            errors.append(
+                f"Dòng {idx+1}: {x_column} = {x:.2f} m > {L_span:.2f} m."
+            )
+
+    return errors
+def validate_local_coordinate(
+    df: pd.DataFrame,
+    L_span: float,
+    column: str = "x_local (m)",
+) -> list[str]:
+    """
+    Kiểm tra tọa độ local của Point Load / Point Moment.
+    """
+
+    errors = []
+
+    if column not in df.columns:
+        return errors
+
+    for i, row in df.iterrows():
+
+        value = row[column]
+
+        if value is None or value == "" or pd.isna(value):
+            continue
+
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+
+            errors.append(
+                f"Dòng {i+1}: {column} không phải số."
+            )
+            continue
+
+        if x < 0:
+
+            errors.append(
+                f"Dòng {i+1}: {column} = {x:.2f} m < 0."
+            )
+
+        elif x > L_span:
+
+            errors.append(
+                f"Dòng {i+1}: {column} = {x:.2f} m > {L_span:.2f} m."
+            )
+
+    return errors
+def reset_keys_with_prefix(*prefixes: str) -> None:
+    """Xóa tất cả session_state key theo prefix VÀ tăng reset_counter
+    để buộc các widget AgGrid (và mọi widget có key động) phải
+    render lại từ đầu với data rỗng khi New Model được bấm."""
+    for k in list(st.session_state.keys()):
+        if any(k.startswith(p) for p in prefixes):
+            st.session_state.pop(k, None)
+    # Tăng counter riêng cho mỗi prefix → key widget AgGrid thay đổi →
+    # Streamlit tạo widget mới → data trong browser DOM bị clear hoàn toàn
+    for p in prefixes:
+        counter_key = f"__reset_cnt_{p}"
+        st.session_state[counter_key] = st.session_state.get(counter_key, 0) + 1
+
+
+def _get_reset_cnt(prefix: str) -> int:
+    """Trả về reset counter hiện tại cho prefix (mặc định 0)."""
+    return st.session_state.get(f"__reset_cnt_{prefix}", 0)
+
+def validate_point_loads(rows, L):
+    errors = []
+
+    for i, row in enumerate(rows, start=1):
+        try:
+            P, x = row
+        except Exception:
+            continue
+
+        if x < 0 or x > L:
+            errors.append(
+                f"Point Load - Dòng {i}: "
+                f"x_local = {x:.3f} m, "
+                f"phải nằm trong [0 ; {L:.3f}] m."
+            )
+
+    return errors
+
+
+def validate_point_moments(rows, L):
+    errors = []
+
+    for i, row in enumerate(rows, start=1):
+        try:
+            M, x = row
+        except Exception:
+            continue
+
+        if x < 0 or x > L:
+            errors.append(
+                f"Point Moment - Dòng {i}: "
+                f"x_local = {x:.3f} m, "
+                f"phải nằm trong [0 ; {L:.3f}] m."
+            )
+
+    return errors
+
+
+def validate_udls(rows, L):
+    errors = []
+
+    for i, row in enumerate(rows, start=1):
+        try:
+            q, x1, x2 = row
+        except Exception:
+            continue
+
+        if x1 < 0:
+            errors.append(
+                f"UDL - Dòng {i}: x1_local < 0."
+            )
+
+        if x2 > L:
+            errors.append(
+                f"UDL - Dòng {i}: x2_local > {L:.3f} m."
+            )
+
+        if x2 <= x1:
+            errors.append(
+                f"UDL - Dòng {i}: x2_local phải lớn hơn x1_local."
+            )
+
+    return errors
+def metric_html(values: list[tuple[str, str]]) -> None:
+    cards = "".join(
+        f"<div class='metric-card'>"
+        f"<div class='metric-label'>{lbl}</div>"
+        f"<div class='metric-value'>{val}</div></div>"
+        for lbl, val in values
+    )
+    st.markdown(f"<div class='metric-strip'>{cards}</div>", unsafe_allow_html=True)
+
+
+def _minimal_docx_bytes(report_text: str, title: str = "Thuyết Minh Tính Toán") -> bytes:
+    """
+    Tạo file .docx hợp lệ TỐI THIỂU bằng cách ghi trực tiếp định dạng OOXML
+    (ZIP + XML chuẩn của Word), KHÔNG phụ thuộc thư viện python-docx.
+
+    Đây là lưới an toàn cuối cùng: nếu vì lý do nào đó server chưa cài được
+    python-docx (ví dụ quên cập nhật requirements.txt), người dùng web VẪN
+    luôn tải được file .docx hợp lệ — không bao giờ thấy lỗi "hãy tự cài thư viện".
+    """
+
+
+    def esc(s: str) -> str:
+        return _xml_escape(s).replace("\t", "    ")
+
+    body_paragraphs = []
+    title_xml = (
+        f'<w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+        f'<w:r><w:rPr><w:b/><w:sz w:val="32"/></w:rPr>'
+        f'<w:t xml:space="preserve">{esc(title)}</w:t></w:r></w:p>'
+    )
+    body_paragraphs.append(title_xml)
+    body_paragraphs.append('<w:p/>')
+
+    for line in report_text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("="):
+            continue
+        is_heading = bool(stripped) and stripped[0].isdigit() and ". " in stripped[:4]
+        if is_heading:
+            run = (f'<w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr>'
+                   f'<w:t xml:space="preserve">{esc(line)}</w:t></w:r>')
+        else:
+            run = (f'<w:r><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/>'
+                   f'<w:sz w:val="18"/></w:rPr>'
+                   f'<w:t xml:space="preserve">{esc(line) if line.strip() else " "}</w:t></w:r>')
+        body_paragraphs.append(f'<w:p>{run}</w:p>')
+
+    body_xml = "".join(body_paragraphs)
+
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>{body_xml}
+<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>
+<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1417"/></w:sectPr>
+</w:body></w:document>'''
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>'''
+
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+
+    doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>'''
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document_xml)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+    return buf.getvalue()
+
+def plotly_to_png_fallback(fig: go.Figure) -> bytes | None:
+    """
+    Fallback dùng Matplotlib, vẽ lại trace, marker, shape và annotation (text, mũi tên đúng chiều).
+    Không cần Chrome/kaleido.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import io
+        import numpy as np
+
+        plt.figure(figsize=(8, 4.5))
+
+        # 1. Vẽ các trace (lines, markers, fills)
+        for tr in fig.data:
+            if hasattr(tr, 'x') and hasattr(tr, 'y') and tr.x is not None and tr.y is not None:
+                try:
+                    x = np.array(tr.x, dtype=float)
+                    y = np.array(tr.y, dtype=float)
+                    color = tr.line.color if hasattr(tr, 'line') and tr.line else '#0000ff'
+                    linewidth = tr.line.width if hasattr(tr, 'line') and tr.line else 1.5
+
+                    mode = tr.mode if hasattr(tr, 'mode') else 'lines'
+                    if 'lines' in mode:
+                        plt.plot(x, y, color=color, linewidth=linewidth)
+
+                    if 'markers' in mode:
+                        marker_size = tr.marker.size if hasattr(tr, 'marker') and tr.marker else 7
+                        marker_color = tr.marker.color if hasattr(tr, 'marker') and tr.marker else color
+                        plt.scatter(x, y, s=marker_size**2, color=marker_color, edgecolors='black', linewidth=0.5)
+
+                    if hasattr(tr, 'fill') and tr.fill == 'tozeroy':
+                        plt.fill_between(x, y, 0, color=color, alpha=0.2)
+                    elif hasattr(tr, 'fill') and tr.fill == 'toself':
+                        plt.fill(x, y, color=color, alpha=0.2)
+                except Exception:
+                    pass
+
+        # 2. Vẽ các shape (ngàm, tam giác gối, v.v.)
+        if fig.layout.shapes:
+            for sh in fig.layout.shapes:
+                try:
+                    if sh.type == 'rect':
+                        x0 = sh.x0 if sh.x0 is not None else 0
+                        x1 = sh.x1 if sh.x1 is not None else 0
+                        y0 = sh.y0 if sh.y0 is not None else 0
+                        y1 = sh.y1 if sh.y1 is not None else 0
+                        rect = patches.Rectangle(
+                            (x0, y0), x1 - x0, y1 - y0,
+                            facecolor=sh.fillcolor if sh.fillcolor else 'gray',
+                            edgecolor=sh.line.color if sh.line else 'black',
+                            linewidth=sh.line.width if sh.line else 1
+                        )
+                        plt.gca().add_patch(rect)
+                except Exception:
+                    pass
+
+        # 3. Vẽ các annotation (text, mũi tên) – chỉ khi annotations không rỗng
+        if fig.layout.annotations:
+            for ann in fig.layout.annotations:
+                try:
+                    # Text (không có mũi tên)
+                    if ann.text and not ann.showarrow:
+                        x = ann.x if ann.x is not None else 0
+                        y = ann.y if ann.y is not None else 0
+                        plt.text(x, y, ann.text,
+                                 fontsize=ann.font.size if ann.font else 10,
+                                 color=ann.font.color if ann.font else 'black',
+                                 ha=ann.xanchor if ann.xanchor else 'center',
+                                 va=ann.yanchor if ann.yanchor else 'center')
+
+                    # Mũi tên: vẽ từ (x, y) đến (ax, ay) (đúng với Plotly)
+                    if ann.showarrow:
+                        # Tail là (ann.ax, ann.ay), Head là (ann.x, ann.y)
+                        x_tail = ann.ax if ann.ax is not None else 0
+                        y_tail = ann.ay if ann.ay is not None else 0
+                        x_head = ann.x if ann.x is not None else 0
+                        y_head = ann.y if ann.y is not None else 0
+
+                        plt.annotate('', xy=(x_head, y_head), xytext=(x_tail, y_tail),
+                                     arrowprops=dict(arrowstyle='->',
+                                                     color=ann.arrowcolor if ann.arrowcolor else 'black',
+                                                     lw=ann.arrowwidth if ann.arrowwidth else 1.5))
+                except Exception:
+                    pass
+
+        # 4. Tiêu đề, nhãn trục, grid
+        title = fig.layout.title.text if fig.layout.title else ''
+        plt.title(title)
+        if fig.layout.xaxis and fig.layout.xaxis.title:
+            plt.xlabel(fig.layout.xaxis.title.text)
+        if fig.layout.yaxis and fig.layout.yaxis.title:
+            plt.ylabel(fig.layout.yaxis.title.text)
+        plt.grid(True)
+
+        # Đồng bộ khoảng trục
+        if fig.layout.xaxis and fig.layout.xaxis.range:
+            plt.xlim(fig.layout.xaxis.range)
+        if fig.layout.yaxis and fig.layout.yaxis.range:
+            plt.ylim(fig.layout.yaxis.range)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=200, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception:
+        return None
+def docx_with_images(
+    report_text: str,
+    report_title: str,
+    figures: list[tuple[str, go.Figure]]
+) -> bytes:
+    """
+    Tạo file DOCX với văn bản và các biểu đồ.
+    Ưu tiên dùng kaleido để có ảnh đẹp, nếu không được thì fallback sang Matplotlib.
+    """
+    from docx import Document
+    from docx.shared import Inches
+    import tempfile
+    import os
+
+    doc = Document()
+    doc.add_heading(report_title, level=1)
+
+    for line in report_text.split('\n'):
+        doc.add_paragraph(line)
+
+    if figures:
+        doc.add_page_break()
+        doc.add_heading('Biểu đồ kết quả', level=1)
+
+        # Chuẩn bị kaleido nếu có thể
+        use_kaleido = ensure_kaleido_chrome()
+
+        for name, fig in figures:
+            doc.add_heading(name, level=2)
+
+            img_bytes = None
+
+            # 1. Thử dùng kaleido (chất lượng cao)
+            if use_kaleido:
+                try:
+                    img_bytes = fig.to_image(
+                        format='png',
+                        width=1600,
+                        height=900,
+                        scale=2,
+                        engine='kaleido'
+                    )
+                except Exception:
+                    img_bytes = None
+
+            # 2. Nếu thất bại, dùng fallback Matplotlib
+            if img_bytes is None:
+                img_bytes = plotly_to_png_fallback(fig)
+                if img_bytes is None:
+                    # 3. Thậm chí fallback cũng lỗi → placeholder
+                    img_bytes = create_placeholder_image(name)
+
+            # Chèn ảnh vào Word
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                with open(tmp_path, 'wb') as f:
+                    f.write(img_bytes)
+                doc.add_picture(tmp_path, width=Inches(6.5))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+def docx_with_images(
+    report_text: str,
+    report_title: str,
+    figures: list[tuple[str, go.Figure]]
+) -> bytes:
+    """Create a polished engineering calculation DOCX with sharp figures."""
+    from docx import Document
+    from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Inches, Pt, RGBColor
+    import os
+    import re
+    import tempfile
+
+    BLUE = RGBColor(31, 77, 120)
+    ACCENT = RGBColor(46, 116, 181)
+    MUTED = RGBColor(95, 105, 115)
+    LIGHT_FILL = "F2F4F7"
+    OK_FILL = "EAF4ED"
+    CONTENT_WIDTH_DXA = 9360
+
+    def set_run_font(run, name="Calibri", size=11, color=None, bold=None, italic=None):
+        run.font.name = name
+        run._element.rPr.rFonts.set(qn("w:ascii"), name)
+        run._element.rPr.rFonts.set(qn("w:hAnsi"), name)
+        run._element.rPr.rFonts.set(qn("w:cs"), name)
+        run.font.size = Pt(size)
+        if color is not None:
+            run.font.color.rgb = color
+        if bold is not None:
+            run.bold = bold
+        if italic is not None:
+            run.italic = italic
+
+    def set_cell_fill(cell, fill):
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shd = tc_pr.find(qn("w:shd"))
+        if shd is None:
+            shd = OxmlElement("w:shd")
+            tc_pr.append(shd)
+        shd.set(qn("w:fill"), fill)
+
+    def set_cell_margins(cell, top=80, start=120, bottom=80, end=120):
+        tc_pr = cell._tc.get_or_add_tcPr()
+        tc_mar = tc_pr.first_child_found_in("w:tcMar")
+        if tc_mar is None:
+            tc_mar = OxmlElement("w:tcMar")
+            tc_pr.append(tc_mar)
+        for key, value in {"top": top, "start": start, "bottom": bottom, "end": end}.items():
+            node = tc_mar.find(qn(f"w:{key}"))
+            if node is None:
+                node = OxmlElement(f"w:{key}")
+                tc_mar.append(node)
+            node.set(qn("w:w"), str(value))
+            node.set(qn("w:type"), "dxa")
+
+    def set_table_width(table, widths_dxa):
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        tbl_pr = table._tbl.tblPr
+        tbl_w = tbl_pr.find(qn("w:tblW"))
+        if tbl_w is None:
+            tbl_w = OxmlElement("w:tblW")
+            tbl_pr.append(tbl_w)
+        tbl_w.set(qn("w:w"), str(sum(widths_dxa)))
+        tbl_w.set(qn("w:type"), "dxa")
+        grid = table._tbl.tblGrid
+        if grid is None:
+            grid = OxmlElement("w:tblGrid")
+            table._tbl.insert(0, grid)
+        for child in list(grid):
+            grid.remove(child)
+        for width in widths_dxa:
+            col = OxmlElement("w:gridCol")
+            col.set(qn("w:w"), str(width))
+            grid.append(col)
+        for row in table.rows:
+            for i, cell in enumerate(row.cells):
+                width = widths_dxa[min(i, len(widths_dxa) - 1)]
+                cell.width = Pt(width / 20)
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                set_cell_margins(cell)
+                tc_pr = cell._tc.get_or_add_tcPr()
+                tc_w = tc_pr.find(qn("w:tcW"))
+                if tc_w is None:
+                    tc_w = OxmlElement("w:tcW")
+                    tc_pr.append(tc_w)
+                tc_w.set(qn("w:w"), str(width))
+                tc_w.set(qn("w:type"), "dxa")
+
+    def add_rule(paragraph, color="2E74B5", size="10", space="8"):
+        p_pr = paragraph._p.get_or_add_pPr()
+        p_bdr = p_pr.find(qn("w:pBdr"))
+        if p_bdr is None:
+            p_bdr = OxmlElement("w:pBdr")
+            p_pr.append(p_bdr)
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), size)
+        bottom.set(qn("w:space"), space)
+        bottom.set(qn("w:color"), color)
+        p_bdr.append(bottom)
+
+    def add_kv_table(doc, rows, widths=(2300, 7060)):
+        table = doc.add_table(rows=0, cols=2)
+        table.style = "Table Grid"
+        for label, value in rows:
+            cells = table.add_row().cells
+            cells[0].text = str(label)
+            cells[1].text = str(value)
+            set_cell_fill(cells[0], LIGHT_FILL)
+        set_table_width(table, list(widths))
+        for row in table.rows:
+            for i, cell in enumerate(row.cells):
+                for p in cell.paragraphs:
+                    p.paragraph_format.space_after = Pt(0)
+                    for r in p.runs:
+                        set_run_font(r, size=9.5, color=BLUE if i == 0 else RGBColor(30, 30, 30), bold=(i == 0))
+        return table
+
+    def add_callout(doc, text, fill=OK_FILL):
+        table = doc.add_table(rows=1, cols=1)
+        table.style = "Table Grid"
+        cell = table.cell(0, 0)
+        cell.text = ""
+        set_cell_fill(cell, fill)
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(text)
+        set_run_font(r, size=10.5, color=RGBColor(28, 88, 48), bold=True)
+        set_table_width(table, [CONTENT_WIDTH_DXA])
+
+    def add_report_line(doc, line):
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"=", "-", " "}:
+            return
+        if re.match(r"^\d+\.\s+", stripped):
+            doc.add_heading(stripped, level=1)
+            return
+        if re.match(r"^[a-z]\.\s+", stripped, flags=re.I):
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after = Pt(3)
+            r = p.add_run(stripped)
+            set_run_font(r, size=10.5, color=BLUE, bold=True)
+            return
+        looks_tabular = "|" in line or "  " in line or re.search(r"[+-]?\d+\.\d{3,}", line)
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(2)
+        r = p.add_run(line)
+        set_run_font(
+            r,
+            name="Consolas" if looks_tabular else "Calibri",
+            size=8.8 if looks_tabular else 10.5,
+            color=RGBColor(35, 35, 35),
+        )
+
+    def clean_title(text):
+        return re.sub(r"<[^>]+>", "", str(text or "")).strip()
+
+    doc = Document()
+    section = doc.sections[0]
+    section.page_width = Cm(21.59)
+    section.page_height = Cm(27.94)
+    section.top_margin = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
+    section.left_margin = Inches(1.0)
+    section.right_margin = Inches(1.0)
+    section.header_distance = Inches(0.492)
+    section.footer_distance = Inches(0.492)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal._element.rPr.rFonts.set(qn("w:ascii"), "Calibri")
+    normal._element.rPr.rFonts.set(qn("w:hAnsi"), "Calibri")
+    normal.font.size = Pt(11)
+    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.10
+    for style_name, size, color, before, after in [
+        ("Heading 1", 16, ACCENT, 16, 8),
+        ("Heading 2", 13, ACCENT, 12, 6),
+        ("Heading 3", 12, BLUE, 8, 4),
+    ]:
+        style = doc.styles[style_name]
+        style.font.name = "Calibri"
+        style._element.rPr.rFonts.set(qn("w:ascii"), "Calibri")
+        style._element.rPr.rFonts.set(qn("w:hAnsi"), "Calibri")
+        style.font.size = Pt(size)
+        style.font.color.rgb = color
+        style.font.bold = True
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+
+    header_p = section.header.paragraphs[0]
+    header_p.text = "Thuyết minh tính toán kết cấu | Beam Analysis Toolbox"
+    header_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    for r in header_p.runs:
+        set_run_font(r, size=8.5, color=MUTED)
+    footer_p = section.footer.paragraphs[0]
+    footer_p.text = "Tài liệu tính toán tự động - cần được kỹ sư phụ trách kiểm tra và phê duyệt trước khi phát hành."
+    footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for r in footer_p.runs:
+        set_run_font(r, size=8, color=MUTED)
+
+    title_p = doc.add_paragraph()
+    title_p.paragraph_format.space_after = Pt(4)
+    r = title_p.add_run("THUYẾT MINH TÍNH TOÁN")
+    set_run_font(r, size=24, color=BLUE, bold=True)
+    subtitle_p = doc.add_paragraph()
+    subtitle_p.paragraph_format.space_after = Pt(12)
+    r = subtitle_p.add_run(report_title)
+    set_run_font(r, size=13, color=MUTED, bold=True)
+    add_rule(subtitle_p)
+
+    add_kv_table(doc, [
+        ("Phần mềm", "Beam Analysis Toolbox"),
+        ("Hạng mục", report_title),
+        ("Phương pháp chính", "Phần tử hữu hạn khung phẳng 2D"),
+        ("Phương pháp đối chiếu", "Maxwell-Mohr / nhân biểu đồ Vereshchagin"),
+        ("Đơn vị", "kN, m, kNm"),
+    ])
+    doc.add_paragraph()
+
+    max_diff = re.search(r"Sai khác lớn nhất:\s*([^\n]+)", report_text)
+    if max_diff:
+        add_callout(doc, f"Kiểm tra độc lập FEM - Vereshchagin: sai khác lớn nhất {max_diff.group(1).strip()}.")
+    else:
+        add_callout(doc, "Thuyết minh bao gồm thiết lập mô hình, điều kiện biên, nội lực, phản lực và kiểm tra cân bằng.")
+
+    doc.add_page_break()
+    doc.add_heading("Nội dung thuyết minh", level=1)
+    for line in report_text.split("\n"):
+        add_report_line(doc, line)
+
+    if figures:
+        doc.add_page_break()
+        doc.add_heading("Biểu đồ kết quả", level=1)
+        use_kaleido = ensure_kaleido_chrome()
+        for idx, (name, fig) in enumerate(figures, 1):
+            img_bytes = None
+            if use_kaleido:
+                try:
+                    img_bytes = fig.to_image(format="png", width=1800, height=1050, scale=2, engine="kaleido")
+                except Exception:
+                    img_bytes = None
+            if img_bytes is None:
+                img_bytes = plotly_to_png_fallback(fig) or create_placeholder_image(name)
+
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(img_bytes)
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.keep_with_next = True
+                p.add_run().add_picture(tmp_path, width=Inches(6.35))
+                cap = doc.add_paragraph()
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap.paragraph_format.space_after = Pt(10)
+                r = cap.add_run(f"Hình {idx}. {clean_title(name)}")
+                set_run_font(r, size=9.5, color=MUTED, italic=True)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def report_panel(
+    report_text: str | None,
+    report_title: str,
+    key_prefix: str,
+    figures=None
+
+) -> None:
+    st.subheader("📋 Thuyết minh tính toán")
+    if not report_text:
+        st.info("Chưa có kết quả. Nhấn **▶ Solve** để tính toán và xem thuyết minh.")
+        return
+
+    st.code(report_text, language=None, line_numbers=False)
+    st.markdown("---")
+    st.caption("✅ Đọc kỹ thuyết minh ở trên. Nếu kết quả hợp lý, bạn có thể xuất file bên dưới.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "⬇️ Xuất .txt",
+            data=report_text.encode("utf-8"),
+            file_name=f"{key_prefix}_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_txt",
+        )
+    with c2:
+
+        try:
+
+            if figures:
+                docx_bytes = docx_with_images(
+                    report_text,
+                    report_title,
+                    figures
+                )
+            else:
+                docx_bytes = build_docx_bytes(
+                    report_text,
+                    report_title
+                )
+
+        except ImportError:
+
+            # fallback không cần python-docx
+            docx_bytes = _minimal_docx_bytes(
+                report_text,
+                report_title
+            )
+
+        except Exception as e:
+
+            st.warning(
+                f"DOCX nâng cao lỗi ({e}). "
+                "Đang dùng DOCX tối giản."
+            )
+
+            docx_bytes = _minimal_docx_bytes(
+                report_text,
+                report_title
+            )
+
+        st.download_button(
+            "⬇️ Xuất .docx",
+            data=docx_bytes,
+            file_name=f"{key_prefix}_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_docx",
+        )
+
+
+# ══════════════════════════════════════════════════════
+#  ── TAB 1: SINGLE BEAM ──────────────────────────────
+# ══════════════════════════════════════════════════════
+
+def validate_single(data: BeamInput) -> list[str]:
+    errors: list[str] = []
+    if data.length <= 0:
+        errors.append("Chiều dài dầm phải lớn hơn 0.")
+    for name, rows in [("Point Load", [(x,) for _, x in data.point_loads]),
+                        ("Point Moment", [(x,) for _, x in data.point_moments])]:
+        for i, (xp,) in enumerate(rows, 1):
+            if xp < 0 or xp > data.length:
+                errors.append(f"{name} dòng {i}: vị trí x phải nằm trong [0, L].")
+    for name, rows in [("UDL", data.udls), ("UVL", data.uvls)]:
+        for i, (_, x1, x2) in enumerate(rows, 1):
+            if x1 < 0 or x2 < 0 or x1 > data.length or x2 > data.length or x2 <= x1:
+                errors.append(f"{name} dòng {i}: cần 0 ≤ x1 < x2 ≤ L.")
+    return errors
+
+
+def draw_supports_single(fig: go.Figure, data: BeamInput) -> None:
+    l = data.length
+    if data.beam_type == "simple":
+        # Node 0 (Gối cố định - Pin: giữ nguyên hình tam giác)
+        fig.add_trace(go.Scatter(
+            x=[0, l / 34, -l / 34, 0], y=[0, -0.37, -0.37, 0],
+            fill="toself", mode="lines",
+            line={"color": COLOR_SUP, "width": 1.5}, fillcolor=COLOR_SUP,
+            hoverinfo="skip"))
+
+        # Node L (Gối di động dầm đơn - Tinh chỉnh khoảng cách thoáng, đẹp)
+        y_top = -0.08
+        y_bot = -0.36
+        y_floor = -0.44
+
+        # Điểm chấm 1 (Phía trên)
+        fig.add_trace(go.Scatter(
+            x=[l], y=[y_top], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP, line=dict(width=1, color=COLOR_SUP)),
+            hoverinfo="skip"
+        ))
+        # Điểm chấm 2 (Phía dưới)
+        fig.add_trace(go.Scatter(
+            x=[l], y=[y_bot], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP, line=dict(width=1, color=COLOR_SUP)),
+            hoverinfo="skip"
+        ))
+        # Thanh thẳng đứng nối liên kết
+        fig.add_trace(go.Scatter(
+            x=[l, l], y=[y_top, y_bot], mode="lines",
+            line=dict(color=COLOR_SUP, width=1.5),
+            hoverinfo="skip"
+        ))
+        # Mặt sàn phẳng ngang
+        fig.add_trace(go.Scatter(
+            x=[l - l / 34, l + l / 34], y=[y_floor, y_floor], mode="lines",
+            line=dict(color=COLOR_SUP, width=2),
+            hoverinfo="skip"
+        ))
+    else:
+        # Gối ngàm cố định (Cantilever - Giữ nguyên)
+        fig.add_shape(type="rect", x0=l, x1=l + l / 42, y0=-0.42, y1=0.42,
+                      fillcolor=COLOR_SUP, line={"color": COLOR_SUP})
+
+
+def plot_load_diagram_single(data: BeamInput) -> go.Figure:
+    l = data.length
+    fig = base_figure("Load diagram", l)
+
+    fig.update_yaxes(
+        range=[-1.55, 1.25],
+        fixedrange=True,
+        showticklabels=False,
+        title=""
+    )
+
+    # ------------------------------------------------------
+    # 0) VẼ DẦM + GỐI
+    # ------------------------------------------------------
+    fig.add_trace(go.Scatter(
+        x=[0, l], y=[0, 0],
+        mode="lines",
+        line={"color": COLOR_BEAM, "width": 8},
+        hoverinfo="skip",
+        showlegend=False
+    ))
+    draw_supports_single(fig, data)
+
+    # ======================================================
+    # 1) POINT LOAD
+    # Quy ước:
+    #   P < 0  -> tải xuống  -> mũi tên từ trên chĩa xuống dầm
+    #   P > 0  -> tải lên    -> mũi tên từ dưới chĩa lên dầm
+    # ======================================================
+    for P, xp in data.point_loads:
+        if P < 0:
+            y_tip = 0.05
+            y_tail = 0.78
+            y_text = 0.90
+        else:
+            y_tip = -0.05
+            y_tail = -0.78
+            y_text = -0.92
+
+        fig.add_annotation(
+            x=xp, y=y_tip,
+            ax=xp, ay=y_tail,
+            xref="x", yref="y",
+            axref="x", ayref="y",
+            showarrow=True,
+            arrowhead=3,
+            arrowsize=1.1,
+            arrowwidth=2.2,
+            arrowcolor=COLOR_SFD,
+            text=""
+        )
+
+        fig.add_annotation(
+            x=xp,
+            y=y_text,
+            text=f"{P:g} kN",
+            showarrow=False,
+            font={"size": 11, "color": COLOR_SFD}
+        )
+
+    # ======================================================
+    # 2) UDL
+    # Quy ước:
+    #   q < 0  -> tải xuống  -> mũi tên từ trên chĩa xuống dầm
+    #   q > 0  -> tải lên    -> mũi tên từ dưới chĩa lên dầm
+    # ======================================================
+    for q, x1, x2 in data.udls:
+        n = max(3, int(np.ceil((x2 - x1) / 0.5)) + 1)
+        xs = np.linspace(x1, x2, n)
+
+        if q < 0:
+            y_load = 0.58
+            y_label = 0.70
+
+            fig.add_trace(go.Scatter(
+                x=[x1, x2, x2, x1, x1],
+                y=[0, 0, y_load, y_load, 0],
+                fill="toself",
+                mode="lines",
+                line={"color": "#168f2c", "width": 1.2},
+                fillcolor="rgba(22,143,44,0.16)",
+                hovertemplate=f"UDL: {q:g} kN/m<extra></extra>",
+                showlegend=False
+            ))
+
+            for xv in xs:
+                fig.add_annotation(
+                    x=xv, y=0.02,
+                    ax=xv, ay=y_load,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=0.95,
+                    arrowwidth=1.5,
+                    arrowcolor="#168f2c",
+                    text=""
+                )
+        else:
+            y_load = -0.58
+            y_label = -0.72
+
+            fig.add_trace(go.Scatter(
+                x=[x1, x2, x2, x1, x1],
+                y=[0, 0, y_load, y_load, 0],
+                fill="toself",
+                mode="lines",
+                line={"color": "#168f2c", "width": 1.2},
+                fillcolor="rgba(22,143,44,0.16)",
+                hovertemplate=f"UDL: {q:g} kN/m<extra></extra>",
+                showlegend=False
+            ))
+
+            for xv in xs:
+                fig.add_annotation(
+                    x=xv, y=-0.02,
+                    ax=xv, ay=y_load,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=0.95,
+                    arrowwidth=1.5,
+                    arrowcolor="#168f2c",
+                    text=""
+                )
+
+        fig.add_annotation(
+            x=(x1 + x2) / 2,
+            y=y_label,
+            text=f"{q:g} kN/m",
+            showarrow=False,
+            font={"size": 11, "color": "#168f2c"}
+        )
+
+    # ======================================================
+    # 3) UVL
+    # ======================================================
+    for q, x1, x2 in data.uvls:
+        n = max(6, int(np.ceil((x2 - x1) / 0.45)) + 1)
+        xs = np.linspace(x1, x2, n)
+
+        amp = 0.58 if q < 0 else -0.58
+
+        if data.uvl_type == "increase":
+            y_profile = np.linspace(0.0, amp, n)
+        else:
+            y_profile = np.linspace(amp, 0.0, n)
+
+        fig.add_trace(go.Scatter(
+            x=list(xs) + [xs[-1], xs[0]],
+            y=list(y_profile) + [0, 0],
+            fill="toself",
+            mode="lines",
+            line={"color": "#168f2c", "width": 1.2},
+            fillcolor="rgba(22,143,44,0.16)",
+            hovertemplate=f"UVL: {q:g} kN/m<extra></extra>",
+            showlegend=False
+        ))
+
+        for xv, yv in zip(xs, y_profile):
+            if abs(yv) < 0.06:
+                continue
+
+            if q < 0:
+                fig.add_annotation(
+                    x=xv, y=0.02,
+                    ax=xv, ay=yv,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=0.9,
+                    arrowwidth=1.4,
+                    arrowcolor="#168f2c",
+                    text=""
+                )
+            else:
+                fig.add_annotation(
+                    x=xv, y=-0.02,
+                    ax=xv, ay=yv,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=0.9,
+                    arrowwidth=1.4,
+                    arrowcolor="#168f2c",
+                    text=""
+                )
+
+        fig.add_annotation(
+            x=(x1 + x2) / 2,
+            y=(0.72 if q < 0 else -0.76),
+            text=f"{q:g} kN/m",
+            showarrow=False,
+            font={"size": 11, "color": "#168f2c"}
+        )
+
+    # ======================================================
+    # 4) POINT MOMENT
+    # Quy ước:
+    #   M < 0  -> clockwise
+    #   M > 0  -> counter-clockwise
+    # ======================================================
+    for M, xp in data.point_moments:
+        col = "#ff2f92"
+
+        if M < 0:
+            # moment âm = chiều kim đồng hồ
+            fig.add_annotation(
+                x=xp + 0.52, y=0.40,
+                ax=xp - 0.52, ay=0.40,
+                xref="x", yref="y",
+                axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=2.0,
+                arrowcolor=col,
+                text=""
+            )
+            fig.add_annotation(
+                x=xp - 0.52, y=0.62,
+                ax=xp + 0.52, ay=0.62,
+                xref="x", yref="y",
+                axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=2.0,
+                arrowcolor=col,
+                text=""
+            )
+        else:
+            # moment dương = ngược chiều kim đồng hồ
+            fig.add_annotation(
+                x=xp - 0.52, y=0.40,
+                ax=xp + 0.52, ay=0.40,
+                xref="x", yref="y",
+                axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=2.0,
+                arrowcolor=col,
+                text=""
+            )
+            fig.add_annotation(
+                x=xp + 0.52, y=0.62,
+                ax=xp - 0.52, ay=0.62,
+                xref="x", yref="y",
+                axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=2.0,
+                arrowcolor=col,
+                text=""
+            )
+
+        fig.add_annotation(
+            x=xp,
+            y=0.86,
+            text=f"{M:g} kNm",
+            showarrow=False,
+            font={"size": 11, "color": col}
+        )
+
+    return fig
+
+
+
+
+
+def plot_sfd_single(result: BeamResult) -> go.Figure:
+    v_range = _padded_range(result.shear)
+    fig = synced_figure("Shear Force Diagram", float(result.x[-1]), y_range=v_range, y_title="Shear (kN)")
+    fig.add_trace(go.Scatter(x=result.x, y=result.shear, mode="lines",
+                             fill="tozeroy", line={"color": COLOR_SFD, "width": 2},
+                             fillcolor="rgba(11,95,255,0.20)",
+                             hovertemplate="x=%{x:.2f}m  V=%{y:.2f}kN<extra></extra>"))
+    fig.update_yaxes(fixedrange=True)
+    return fig
+
+
+def plot_bmd_single(result: BeamResult) -> go.Figure:
+    m_range = _padded_range(result.moment)
+    fig = synced_figure(
+        "Bending Moment Diagram",
+        float(result.x[-1]),
+        y_range=m_range,
+        y_title="Moment (kNm)"
+    )
+    fig.add_trace(go.Scatter(
+        x=result.x,
+        y=result.moment,
+        mode="lines",
+        fill="tozeroy",
+        line={
+            "color": COLOR_BMD,
+            "width": 2
+        },
+        fillcolor="rgba(255,43,43,0.22)",
+        hovertemplate=
+        "x=%{x:.2f}m  M=%{y:.2f}kNm<extra></extra>"
+    ))
+    fig.update_yaxes(autorange="reversed", fixedrange=True)
+    return fig
+
+
+def plot_elastic_single(data: BeamInput, result: BeamResult | None) -> go.Figure:
+    l = data.length
+    # Tạo figure mới với layout giống load diagram
+    fig = base_figure("Elastic Curve", l)
+    fig.update_yaxes(
+        range=[-1.5, 1.2],
+        fixedrange=True,
+        title="Deflection (visual)"
+    )
+    # Vẽ dầm
+    fig.add_trace(go.Scatter(
+        x=[0, l], y=[0, 0],
+        mode="lines",
+        line={"color": COLOR_BEAM, "width": 8},
+        hoverinfo="skip"
+    ))
+    # Vẽ gối
+    draw_supports_single(fig, data)
+
+    # Vẽ đường cong võng nếu có kết quả
+    if result is not None:
+        mw = float(np.max(np.abs(result.deflection)))
+        y = -result.deflection * (0.65 / mw) if mw > 0 else result.deflection
+        fig.add_trace(go.Scatter(
+            x=result.x, y=y,
+            mode="lines",
+            line={"color": COLOR_ELAST, "width": 4},
+            hovertemplate="x=%{x:.2f}m  w/EI=%{customdata:.4f}<extra></extra>",
+            customdata=result.deflection
+        ))
+
+    fig.update_layout(title={"text": "<b>Elastic Curve</b>", "x": 0.5, "font": {"size": 15}})
+    return fig
+
+
+def metric_strip_single(result: BeamResult | None, data: BeamInput) -> None:
+    if result is None:
+        values = [("Span", f"{data.length:.2f} m"),
+                  ("Point loads", str(len(data.point_loads))),
+                  ("UDL / UVL", f"{len(data.udls)} / {len(data.uvls)}"),
+                  ("Status", "Ready")]
+    elif data.beam_type == "simple":
+        idx_v = int(np.argmax(np.abs(result.shear)))
+        idx_m = int(np.argmax(np.abs(result.moment)))
+        idx_w = int(np.argmax(np.abs(result.deflection)))
+        values = [("R1 / R2", f"{result.r1:.2f} / {result.r2:.2f} kN"),
+                  ("Vmax", f"{result.shear[idx_v]:.2f} kN"),
+                  ("Mmax", f"{result.moment[idx_m]:.2f} kNm"),
+                  ("wmax/EI", f"{result.deflection[idx_w]:.4f}")]
+    else:
+        idx_v = int(np.argmax(np.abs(result.shear)))
+        idx_w = int(np.argmax(np.abs(result.deflection)))
+        values = [("RV", f"{result.rv_fixed:.2f} kN"),
+                  ("MR", f"{result.mr_fixed:.2f} kNm"),
+                  ("Vmax", f"{result.shear[idx_v]:.2f} kN"),
+                  ("wmax/EI", f"{result.deflection[idx_w]:.4f}")]
+    metric_html(values)
+
+# ==========================================================
+# AGGRID INPUT HELPERS
+# ==========================================================
+def _ensure_min_rows(df: pd.DataFrame, n: int = 8) -> pd.DataFrame:
+    """Đảm bảo bảng luôn có sẵn vài dòng trống để nhập liên tục bằng bàn phím."""
+    df = df.copy()
+    if len(df) < n:
+        extra = pd.DataFrame([{c: None for c in df.columns} for _ in range(n - len(df))])
+        df = pd.concat([df, extra], ignore_index=True)
+    return df
+
+
+def keyboard_grid(
+    key: str,
+    df: pd.DataFrame,
+    height: int = 260,
+    min_rows: int = 8,
+    reset_cnt: int = 0,
+) -> pd.DataFrame:
+    """
+    Bảng nhập liệu bằng AgGrid.
+    reset_cnt: truyền vào _get_reset_cnt(prefix) để buộc AgGrid
+    tạo widget mới (xóa data browser DOM) khi New Model được bấm.
+    """
+    df = _ensure_min_rows(df, min_rows)
+
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(
+        editable=True, resizable=True, sortable=False, filter=False,
+    )
+    gb.configure_grid_options(
+        enterMovesDownAfterEdit=True,
+        singleClickEdit=True,
+        stopEditingWhenCellsLoseFocus=True,
+        suppressRowClickSelection=True,
+        rowSelection="single",
+        enableRangeSelection=True,
+        undoRedoCellEditing=True,
+        undoRedoCellEditingLimit=30,
+    )
+    for c in df.columns:
+        gb.configure_column(c, type=["numericColumn"], precision=4)
+
+    grid_options = gb.build()
+
+    # Nhúng reset_cnt vào key → Streamlit tạo widget mới khi counter thay đổi
+    # → AgGrid render từ đầu với df rỗng → data trong browser bị clear
+    widget_key = f"{key}__r{reset_cnt}"
+
+    resp = AgGrid(
+        df,
+        gridOptions=grid_options,
+        key=widget_key,
+        height=height,
+        fit_columns_on_grid_load=True,
+        allow_unsafe_jscode=True,
+        update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED,
+        data_return_mode=DataReturnMode.AS_INPUT,
+        reload_data=False,
+    )
+
+    return pd.DataFrame(resp["data"])
+
+
+def clean_rows_aggrid(df: pd.DataFrame, cols: list[str]) -> list[tuple]:
+    """
+    Làm sạch dữ liệu từ AgGrid:
+    - bỏ các dòng trống
+    - ép float
+    - chỉ giữ dòng đủ dữ liệu
+    """
+    if df is None or df.empty:
+        return []
+
+    out = []
+    for _, row in df.iterrows():
+        vals = []
+        ok = True
+        for c in cols:
+            v = row.get(c, None)
+            if pd.isna(v) or v == "":
+                ok = False
+                break
+            try:
+                vals.append(float(v))
+            except Exception:
+                ok = False
+                break
+        if ok:
+            out.append(tuple(vals))
+    return out
+def render_single_beam() -> None:
+    with st.sidebar:
+        st.header("⚙️ Single Beam — Input")
+        if st.button("🆕 New Model", type="primary", use_container_width=True, key="sb_new_btn"):
+            # Quét sạch MỌI biến, widget, data, result có tiền tố "sb_"
+            reset_keys_with_prefix("sb_")
+            st.rerun()
+            for k in [
+                "sb_pl_df", "sb_pm_df", "sb_udl_df", "sb_uvl_df",
+                "sb_pl_grid", "sb_pm_grid", "sb_udl_grid", "sb_uvl_grid",
+                "sb_result", "sb_input"
+            ]:
+                st.session_state.pop(k, None)
+            st.rerun()
+        st.divider()
+        length = st.number_input("Chiều dài L (m)", min_value=0.01, value=10.0, step=0.5,
+                                 format="%.2f", key="sb_L")
+        bt = st.radio("Type of Beam", ["Simply Supported", "Cantilever"],
+                      horizontal=True, key="sb_bt")
+        ut = st.radio("UVL Type", ["Increase", "Decrease"],
+                      horizontal=True, key="sb_ut")
+        st.divider()
+        st.caption("Nhập tải trong các bảng ở vùng làm việc chính.")
+
+    data = BeamInput(
+        length=float(length),
+        beam_type="simple" if bt == "Simply Supported" else "cantilever",
+        uvl_type="increase" if ut == "Increase" else "decrease",
+    )
+
+    # ── Load tables: keyboard-friendly via AgGrid ─────────────────────
+    pl_default = pd.DataFrame(columns=["P (kN)", "x (m)"])
+    pm_default = pd.DataFrame(columns=["M (kNm)", "x (m)"])
+    udl_default = pd.DataFrame(columns=["q (kN/m)", "x1 (m)", "x2 (m)"])
+    uvl_default = pd.DataFrame(columns=["qmax (kN/m)", "x1 (m)", "x2 (m)"])
+
+    # Chỉ khởi tạo nếu chưa có (setdefault an toàn với DataFrame)
+    if "sb_pl_df"  not in st.session_state: st.session_state["sb_pl_df"]  = pl_default.copy()
+    if "sb_pm_df"  not in st.session_state: st.session_state["sb_pm_df"]  = pm_default.copy()
+    if "sb_udl_df" not in st.session_state: st.session_state["sb_udl_df"] = udl_default.copy()
+    if "sb_uvl_df" not in st.session_state: st.session_state["sb_uvl_df"] = uvl_default.copy()
+
+    _sb_cnt = _get_reset_cnt("sb_")
+
+    t1, t2, t3, t4 = st.tabs(["Point Load", "Point Moment", "UDL", "UVL"])
+
+    with t1:
+        st.caption("Mẹo: click 1 ô rồi dùng Tab để nhập nhanh.")
+        pl = keyboard_grid("sb_pl_grid", st.session_state["sb_pl_df"], height=220, min_rows=8, reset_cnt=_sb_cnt)
+        st.session_state["sb_pl_df"] = pl
+
+    with t2:
+        st.caption("Mẹo: click 1 ô rồi dùng Tab để nhập nhanh.")
+        pm = keyboard_grid("sb_pm_grid", st.session_state["sb_pm_df"], height=220, min_rows=8, reset_cnt=_sb_cnt)
+        st.session_state["sb_pm_df"] = pm
+
+    with t3:
+        st.caption("Mẹo: click 1 ô rồi dùng Tab để nhập nhanh.")
+        udl = keyboard_grid("sb_udl_grid", st.session_state["sb_udl_df"], height=220, min_rows=8, reset_cnt=_sb_cnt)
+        st.session_state["sb_udl_df"] = udl
+
+    with t4:
+        st.caption("Mẹo: click 1 ô rồi dùng ↑ ↓ ← →, Enter, Tab để nhập nhanh.")
+        uvl = keyboard_grid("sb_uvl_grid", st.session_state["sb_uvl_df"], height=220, min_rows=8, reset_cnt=_sb_cnt)
+        st.session_state["sb_uvl_df"] = uvl
+
+    data.point_loads = clean_rows_aggrid(pl, ["P (kN)", "x (m)"])
+    data.point_moments = clean_rows_aggrid(pm, ["M (kNm)", "x (m)"])
+    data.udls = clean_rows_aggrid(udl, ["q (kN/m)", "x1 (m)", "x2 (m)"])
+    data.uvls = clean_rows_aggrid(uvl, ["qmax (kN/m)", "x1 (m)", "x2 (m)"])
+
+    result: BeamResult | None = st.session_state.get("sb_result")
+
+    if st.button("▶ Solve", type="primary", use_container_width=True, key="sb_solve"):
+        errs = validate_single(data)
+        if errs:
+            for e in errs: st.error(e)
+            result = None
+        else:
+            try:
+                result = solve_beam(data)
+                st.session_state.sb_result = result
+                st.session_state.sb_input  = data
+            except Exception as e:
+                st.error(str(e)); result = None
+
+    metric_strip_single(result, data)
+
+    left, right = st.columns([1.7, 1], gap="large")
+    with left:
+        a, b = st.columns(2)
+        with a: st.plotly_chart(plot_load_diagram_single(data), use_container_width=True)
+        with b: st.plotly_chart(
+            plot_sfd_single(result) if result else base_figure("Shear Force Diagram", data.length, "kN"),
+            use_container_width=True)
+        c, d = st.columns(2)
+        with c: st.plotly_chart(
+            plot_bmd_single(result) if result else base_figure("Moment Diagram", data.length, "kNm"),
+            use_container_width=True)
+        with d: st.plotly_chart(plot_elastic_single(data, result), use_container_width=True)
+
+
+    with right:
+        figures = []
+
+        if result:
+            figures.append(
+            ("Load Diagram",
+             plot_load_diagram_single(data))
+        )
+
+            figures.append(
+            ("Shear Force Diagram",
+             plot_sfd_single(result))
+        )
+
+            figures.append(
+            ("Bending Moment Diagram",
+             plot_bmd_single(result))
+        )
+
+            figures.append(
+            ("Elastic Curve",
+             plot_elastic_single(data, result))
+        )
+
+    report_panel(
+        result.report if result else None,
+        "Thuyết Minh — Dầm Đơn",
+        "single_beam",
+        figures=figures
+    )
+# ══════════════════════════════════════════════════════
+#  ── TAB 2: CONTINUOUS BEAM ──────────────────────────
+# ══════════════════════════════════════════════════════
+
+def render_continuous_beam() -> None:
+    with st.sidebar:
+        st.header("⚙️ Continuous Beam — Input")
+        if st.button("🆕 New Model", type="primary", use_container_width=True, key="cb_new_btn"):
+            reset_keys_with_prefix("cb_")
+            st.rerun()
+        st.divider()
+
+        n_spans = st.number_input("Số nhịp", min_value=1, max_value=20, value=2, step=1, key="cb_nspans")
+        st.divider()
+
+        st.markdown("**Thông số từng nhịp**")
+        span_lengths, span_EIs = [], []
+        for i in range(int(n_spans)):
+            c1, c2 = st.columns(2)
+            with c1:
+                L_i = st.number_input(f"L{i+1} (m)", min_value=0.01, value=5.0, step=0.5, format="%.2f", key=f"cb_L{i}")
+            with c2:
+                EI_i = st.number_input(f"EI{i+1}", min_value=1e-6, value=1.0, step=100.0, format="%.4g", key=f"cb_EI{i}")
+            span_lengths.append(float(L_i))
+            span_EIs.append(float(EI_i))
+
+        st.divider()
+        n_nodes_boundary = int(n_spans) + 1
+        st.markdown("**Gối đỡ**")
+        support_kinds = []
+        for i in range(n_nodes_boundary):
+            xpos = sum(span_lengths[:i])
+            kind = st.selectbox(
+                f"Node {i} (x={xpos:.2f}m)",
+                ["pin", "roller", "fixed", "free"],
+                key=f"cb_sup{i}",
+                index=0 if i == 0 else (0 if i == n_nodes_boundary-1 else 0),
+            )
+            support_kinds.append(kind)
+
+        st.divider()
+        st.caption("Nhập tải trọng trong bảng ở vùng làm việc chính.")
+
+    st.markdown("#### Tải trọng từng nhịp")
+    span_pl, span_udl, span_pm = [], [], []
+    _cb_cnt = _get_reset_cnt("cb_")
+
+    for i in range(int(n_spans)):
+        with st.expander(f"Nhịp {i+1}  (L = {span_lengths[i]:.2f} m)", expanded=(i == 0)):
+            t1, t2, t3 = st.tabs(["Point Load", "UDL", "Point Moment"])
+            with t1:
+                key_pl = f"cb_pl_df_{i}"
+                if key_pl not in st.session_state:
+                    st.session_state[key_pl] = pd.DataFrame(columns=["P (kN)", "x_local (m)"])
+                df_pl = keyboard_grid(f"cb_pl_grid_{i}", st.session_state[key_pl], height=210, min_rows=6, reset_cnt=_cb_cnt)
+                st.session_state[key_pl] = df_pl
+
+            with t2:
+                key_udl = f"cb_udl_df_{i}"
+                if key_udl not in st.session_state:
+                    st.session_state[key_udl] = pd.DataFrame(columns=["q (kN/m)", "x1_local (m)", "x2_local (m)"])
+                df_udl = keyboard_grid(f"cb_udl_grid_{i}", st.session_state[key_udl], height=210, min_rows=6, reset_cnt=_cb_cnt)
+                st.session_state[key_udl] = df_udl
+
+            with t3:
+                key_pm = f"cb_pm_df_{i}"
+                if key_pm not in st.session_state:
+                    st.session_state[key_pm] = pd.DataFrame(columns=["M (kNm)", "x_local (m)"])
+                df_pm = keyboard_grid(f"cb_pm_grid_{i}", st.session_state[key_pm], height=210, min_rows=6, reset_cnt=_cb_cnt)
+                st.session_state[key_pm] = df_pm
+
+            span_pl.append(clean_rows_aggrid(df_pl, ["P (kN)", "x_local (m)"]))
+            span_udl.append(clean_rows_aggrid(df_udl, ["q (kN/m)", "x1_local (m)", "x2_local (m)"]))
+            span_pm.append(clean_rows_aggrid(df_pm, ["M (kNm)", "x_local (m)"]))
+
+    errors = []
+
+    errors.extend(
+        validate_point_loads(
+            span_pl[i],
+            span_lengths[i]
+        )
+    )
+
+    errors.extend(
+        validate_udls(
+            span_udl[i],
+            span_lengths[i]
+        )
+    )
+
+    errors.extend(
+        validate_point_moments(
+            span_pm[i],
+            span_lengths[i]
+        )
+    )
+
+    if errors:
+
+        st.error(
+            f"❌ Nhịp {i + 1}: Có tải trọng nằm ngoài chiều dài nhịp."
+        )
+
+        st.info(
+            f"📏 Chỉ được nhập trong khoảng: "
+            f"0.00 ≤ x_local ≤ {span_lengths[i]:.2f} m"
+        )
+
+        for msg in errors:
+            st.warning(msg)
+    result_cb: ContinuousBeamResult | None = st.session_state.get("cb_result")
+    disable_solve = False
+
+    for i in range(int(n_spans)):
+        errors = []
+
+        errors.extend(
+            validate_point_loads(
+                span_pl[i],
+                span_lengths[i]
+            )
+        )
+
+        errors.extend(
+            validate_udls(
+                span_udl[i],
+                span_lengths[i]
+            )
+        )
+
+        errors.extend(
+            validate_point_moments(
+                span_pm[i],
+                span_lengths[i]
+            )
+        )
+
+        if errors:
+
+            st.error(
+                f"❌ Nhịp {i + 1}: Có tải trọng không hợp lệ."
+            )
+
+            st.info(
+                f"📏 Chỉ được nhập trong khoảng "
+                f"0 ≤ x_local ≤ {span_lengths[i]:.2f} m"
+            )
+
+            for err in errors:
+                st.warning(err)
+        if validate_point_loads(span_pl[i], span_lengths[i]):
+            disable_solve = True
+
+        if validate_udls(span_udl[i], span_lengths[i]):
+            disable_solve = True
+
+        if validate_point_moments(span_pm[i], span_lengths[i]):
+            disable_solve = True
+    solve_clicked = st.button(
+        "▶ Solve",
+        type="primary",
+        use_container_width=True,
+        key="cb_solve",
+        disabled=disable_solve,
+    )
+
+    if solve_clicked:
+        try:
+            spans_def = []
+
+            for i in range(int(n_spans)):
+                spans_def.append(
+                    SpanDef(
+                        length=span_lengths[i],
+                        EI=span_EIs[i],
+                        point_loads=[(P, x) for P, x in span_pl[i]],
+                        udls=[(q, x1, x2) for q, x1, x2 in span_udl[i]],
+                        point_moments=[(M, x) for M, x in span_pm[i]],
+                    )
+                )
+
+            supports_def = [
+                SupportDef(node=i, kind=support_kinds[i])
+                for i in range(n_nodes_boundary)
+                if support_kinds[i] != "free"
+            ]
+
+            cb_input = ContinuousBeamInput(
+                spans=spans_def,
+                supports=supports_def,
+            )
+
+            result_cb = solve_continuous_beam(cb_input)
+
+            st.session_state.cb_result = result_cb
+            st.session_state.cb_input = cb_input
+
+        except Exception as e:
+
+            st.error(f"Lỗi tính toán: {e}")
+
+            result_cb = None
+
+    if result_cb is None:
+        total_L = sum(span_lengths)
+        metric_html([("Tổng L", f"{total_L:.2f} m"), ("Số nhịp", str(n_spans)), ("Số gối", str(sum(1 for k in support_kinds if k != "free"))), ("Status", "Ready")])
+    else:
+        xv = result_cb.x_global
+        V, M, w = result_cb.shear, result_cb.moment, result_cb.deflection
+        iv, im, iw = int(np.argmax(np.abs(V))), int(np.argmax(np.abs(M))), int(np.argmax(np.abs(w)))
+        metric_html([("Vmax", f"{V[iv]:.3f} kN  @x={xv[iv]:.2f}m"),
+                     ("Mmax", f"{M[im]:.3f} kNm @x={xv[im]:.2f}m"),
+                     ("wmax/EI", f"{w[iw]:.5f} m  @x={xv[iw]:.2f}m"),
+                     ("Gối", f"{len(result_cb.reactions)} phản lực")])
+
+    total_L_plot = sum(span_lengths)
+    fig_load = None
+    fig_sfd = None
+    fig_bmd = None
+    fig_el = None
+    left, right = st.columns([1.7, 1], gap="large")
+    with left:
+        fig_load = _cb_load_diagram(span_lengths, span_EIs, span_pl, span_udl, support_kinds,span_pm,
+    )
+        a, b = st.columns(2)
+        with a: st.plotly_chart(fig_load, use_container_width=True)
+        with b:
+            if result_cb:
+                v_range = _padded_range(result_cb.shear)
+                fig_sfd = synced_figure("Shear Force Diagram", total_L_plot, y_range=v_range, y_title="V (kN)")
+                fig_sfd.add_trace(go.Scatter(x=result_cb.x_global, y=result_cb.shear, mode="lines", fill="tozeroy", line={"color": COLOR_SFD, "width": 2}, fillcolor="rgba(11,95,255,0.20)", hovertemplate="x=%{x:.3f}m  V=%{y:.3f}kN<extra></extra>"))
+                fig_sfd.update_yaxes(fixedrange=True)
+                st.plotly_chart(fig_sfd, use_container_width=True)
+            else:
+                st.plotly_chart(base_figure("Shear Force Diagram", total_L_plot, "V (kN)"), use_container_width=True)
+
+        c, d = st.columns(2)
+        with c:
+            if result_cb:
+                m_range = _padded_range(result_cb.moment)
+                fig_bmd = synced_figure("Bending Moment Diagram", total_L_plot, y_range=m_range, y_title="M (kNm)")
+                fig_bmd.add_trace(go.Scatter(x=result_cb.x_global, y=result_cb.moment, mode="lines", fill="tozeroy", line={"color": COLOR_BMD, "width": 2}, fillcolor="rgba(255,43,43,0.22)", hovertemplate="x=%{x:.3f}m  M=%{y:.3f}kNm<extra></extra>"))
+                fig_bmd.update_yaxes(autorange="reversed", fixedrange=True)
+                st.plotly_chart(fig_bmd, use_container_width=True)
+            else:
+                st.plotly_chart(base_figure("Bending Moment Diagram", total_L_plot, "M (kNm)"), use_container_width=True)
+        with d:
+            if result_cb:
+                # 1. Khởi dựng phôi nền sạch từ hàm bổ trợ (Đồng bộ dải hiển thị cố định)
+                fig_el = _cb_draw_base_beam_and_supports(total_L_plot, span_lengths, support_kinds)
+                fig_el.update_layout(title={"text": "<b>Elastic Curve</b>"})
+
+                # 2. Vẽ đường cong võng (khống chế biên độ trực quan tối đa là 0.65 để thoáng đồ thị)
+                mw = float(np.max(np.abs(result_cb.deflection))) + 1e-30
+                y_vis = -result_cb.deflection * (0.65 / mw)
+
+                fig_el.add_trace(go.Scatter(
+                    x=result_cb.x_global, y=y_vis, mode="lines",
+                    line={"color": COLOR_ELAST, "width": 3},
+                    hovertemplate="x=%{x:.3f}m  w/EI=%{customdata:.5f}<extra></extra>",
+                    customdata=result_cb.deflection
+                ))
+
+                # 3. Đồng bộ trục Y khớp hoàn toàn với biểu đồ Load Diagram
+                fig_el.update_yaxes(
+                    range=[-1.5, 1.2],
+                    fixedrange=True,
+                    showticklabels=True,
+                    title="Deflection (visual)"
+                )
+                st.plotly_chart(fig_el, use_container_width=True)
+            else:
+                fig_empty = go.Figure()
+                fig_empty.update_layout(height=315, title="<b>Elastic Curve</b>", xaxis=dict(range=[0, total_L_plot]))
+                fig_empty.update_yaxes(range=[-1.5, 1.2], fixedrange=True)
+                st.plotly_chart(fig_empty, use_container_width=True)
+    with right:
+
+        figures = []
+
+        if result_cb:
+
+            if fig_load is not None:
+                figures.append(("Load Diagram", fig_load))
+
+            if fig_sfd is not None:
+                figures.append(("Shear Force Diagram", fig_sfd))
+
+            if fig_bmd is not None:
+                figures.append(("Bending Moment Diagram", fig_bmd))
+
+            if fig_el is not None:
+                figures.append(("Elastic Curve", fig_el))
+
+        report_panel(
+            result_cb.report if result_cb else None,
+            "Thuyết Minh — Dầm Liên Tục",
+            "cont_beam",
+            figures=figures
+        )
+
+def _cb_draw_base_beam_and_supports(total_L, span_lengths, support_kinds) -> go.Figure:
+    """Hàm dựng khung dầm và gối đỡ nền đồng bộ tỷ lệ hiển thị"""
+
+    fig = go.Figure()
+
+    # khoảng trống hai đầu để không cắt gối
+    margin_x = max(total_L * 0.06, 0.5)
+
+    # 1. Layout
+    fig.update_layout(
+        title=dict(
+            x=0.5,
+            xanchor="center",
+            font=dict(size=14, color="#333333")
+        ),
+
+        height=315,
+
+        margin=dict(
+            l=55,
+            r=20,
+            t=60,
+            b=75
+        ),
+
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+
+        xaxis=dict(
+            title="x (m)",
+            range=[-margin_x, total_L + margin_x],
+            showgrid=True,
+            linecolor="gray",
+            gridcolor="rgba(128,128,128,0.15)"
+        )
+    )
+
+
+    fig.update_yaxes(
+        range=[-1.5, 1.2],
+        fixedrange=True,
+        showgrid=False,
+        linecolor="gray",
+        showticklabels=False,
+        title=""
+    )
+
+
+    # 2. Thanh dầm
+    fig.add_trace(
+        go.Scatter(
+            x=[0, total_L],
+            y=[0, 0],
+            mode="lines",
+            line={
+                "color": COLOR_BEAM,
+                "width": 8
+            },
+            hoverinfo="skip"
+        )
+    )
+
+
+    # Nhãn nhịp
+    x_acc = 0.0
+
+    for i, Ls in enumerate(span_lengths):
+        mid = x_acc + Ls / 2
+
+        fig.add_annotation(
+            x=mid,
+            y=0.2,
+            text=f"L{i+1}={Ls:.1f}m",
+            showarrow=False,
+            font={
+                "size":10,
+                "color":"#555"
+            }
+        )
+
+        x_acc += Ls
+
+
+
+    # 3. Gối
+    node_xs = [0.0] + list(np.cumsum(span_lengths))
+
+    support_size = max(total_L * 0.035, 0.25)
+
+
+    for i, kind in enumerate(support_kinds):
+
+        xp = node_xs[i]
+
+
+        # gối pin
+        if kind == "pin":
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        xp,
+                        xp + support_size,
+                        xp - support_size,
+                        xp
+                    ],
+
+                    y=[
+                        0,
+                        -0.37,
+                        -0.37,
+                        0
+                    ],
+
+                    fill="toself",
+                    mode="lines",
+                    line={
+                        "color":COLOR_SUP,
+                        "width":1.5
+                    },
+                    fillcolor=COLOR_SUP,
+                    hoverinfo="skip"
+                )
+            )
+
+
+        # gối con lăn
+        elif kind == "roller":
+
+            y_top = -0.08
+            y_bot = -0.36
+            y_floor = -0.44
+
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[xp],
+                    y=[y_top],
+                    mode="markers",
+                    marker=dict(
+                        symbol="circle",
+                        size=7,
+                        color=COLOR_SUP
+                    ),
+                    hoverinfo="skip"
+                )
+            )
+
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[xp],
+                    y=[y_bot],
+                    mode="markers",
+                    marker=dict(
+                        symbol="circle",
+                        size=7,
+                        color=COLOR_SUP
+                    ),
+                    hoverinfo="skip"
+                )
+            )
+
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[xp,xp],
+                    y=[y_top,y_bot],
+                    mode="lines",
+                    line=dict(
+                        color=COLOR_SUP,
+                        width=1.5
+                    ),
+                    hoverinfo="skip"
+                )
+            )
+
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        xp-support_size,
+                        xp+support_size
+                    ],
+                    y=[
+                        y_floor,
+                        y_floor
+                    ],
+                    mode="lines",
+                    line=dict(
+                        color=COLOR_SUP,
+                        width=2
+                    ),
+                    hoverinfo="skip"
+                )
+            )
+
+
+
+        # ngàm
+        elif kind == "fixed":
+
+            fig.add_shape(
+                type="rect",
+                x0=xp-total_L/80,
+                x1=xp+total_L/80,
+                y0=-0.42,
+                y1=0.42,
+                fillcolor=COLOR_SUP,
+                line={"color":COLOR_SUP}
+            )
+
+
+        fig.add_annotation(
+            x=xp,
+            y=-0.68,
+            text=f"N{i}",
+            showarrow=False,
+            font={
+                "size":10,
+                "color":COLOR_SUP
+            }
+        )
+
+
+    return fig
+
+
+def _cb_load_diagram(span_lengths, span_EIs, span_pl, span_udl, support_kinds, span_pm=None) -> go.Figure:
+
+    total_L = sum(span_lengths)
+
+    fig = _cb_draw_base_beam_and_supports(
+        total_L,
+        span_lengths,
+        support_kinds
+    )
+
+    fig.update_layout(
+        title={
+            "text": "<b>Load Diagram — Dầm liên tục</b>",
+            "x":0.5
+        }
+    )
+
+    node_xs = [0.0] + list(np.cumsum(span_lengths))
+
+
+    # ===============================
+    # TẢI TRỌNG THEO TỪNG NHỊP
+    # ===============================
+    for i in range(len(span_lengths)):
+
+        x0_span = node_xs[i]
+
+
+        # -------------------------------
+        # UDL
+        # -------------------------------
+        for q, x1_local, x2_local in span_udl[i]:
+
+            if abs(q) < 1e-9:
+                continue
+
+            x1 = x0_span + x1_local
+            x2 = x0_span + x2_local
+
+
+            # q dương: hướng xuống vào dầm
+            # q âm: hướng lên vào dầm
+            if q > 0:
+                y_load = -0.58
+                arrow_start = -0.75
+                arrow_end = -0.06
+            else:
+                y_load = 0.58
+                arrow_start = 0.75
+                arrow_end = 0.06
+            # vùng tải
+            fig.add_trace(
+                go.Scatter(
+                    x=[x1,x2,x2,x1,x1],
+                    y=[0,0,y_load,y_load,0],
+                    fill="toself",
+                    mode="lines",
+                    line=dict(
+                        color="#28a745",
+                        width=1
+                    ),
+                    fillcolor="rgba(40,167,69,0.15)",
+                    hoverinfo="skip"
+                )
+            )
+
+
+            # mũi tên UDL
+            for xx in np.linspace(
+                x1,
+                x2,
+                max(3,int((x2-x1)/0.5))
+            ):
+
+                fig.add_annotation(
+                    x=xx,
+                    y=arrow_end,
+                    ax=xx,
+                    ay=arrow_start,
+                    xref="x",
+                    yref="y",
+                    axref="x",
+                    ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=1.5,
+                    arrowcolor="#28a745"
+                )
+
+
+            fig.add_annotation(
+                x=(x1+x2)/2,
+                y=y_load*1.25,
+                text=f"{q:.1f} kN/m",
+                showarrow=False,
+                font=dict(
+                    size=10,
+                    color="#28a745"
+                )
+            )
+
+
+
+        # -------------------------------
+        # POINT LOAD
+        # -------------------------------
+        for P,x_local in span_pl[i]:
+
+            xp = x0_span + x_local
+
+
+            if P > 0:
+                ay = -0.75
+                y = -0.05
+            else:
+                ay = 0.75
+                y = 0.05
+
+
+            fig.add_annotation(
+                x=xp,
+                y=y,
+                ax=xp,
+                ay=ay,
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=3,
+                arrowsize=1.1,
+                arrowwidth=2,
+                arrowcolor="#0b5fff"
+            )
+
+            fig.add_annotation(
+                x=xp,
+                y=ay,
+                text=f"{P:.1f} kN",
+                showarrow=False,
+                font=dict(
+                    size=10,
+                    color="#0b5fff"
+                )
+            )
+
+        # -------------------------------
+        # POINT MOMENT (ký hiệu moment chuẩn)
+        # -------------------------------
+        if span_pm is not None:
+
+            for M, x_local in span_pm[i]:
+
+                xm = x0_span + x_local
+
+                r = total_L * 0.025  # bán kính vòng moment
+                y0 = 0.25
+
+                # góc tạo vòng cung — ĐỒNG BỘ với bản MATLAB gốc:
+                # M > 0 → quét CCW (dưới-phải → trên-trái, mũi tên chỉ sang trái)
+                # M < 0 → quét CW  (dưới-trái → trên-phải, mũi tên chỉ sang phải)
+                if M > 0:
+                    theta = np.linspace(-np.pi * 0.25, np.pi * 0.85, 40)
+                else:
+                    theta = np.linspace(np.pi * 1.25, np.pi * 0.15, 40)
+
+                x_arc = xm + r * np.cos(theta)
+                y_arc = y0 + r * np.sin(theta)
+
+                # vòng cung
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_arc,
+                        y=y_arc,
+                        mode="lines",
+                        line=dict(
+                            color="#ff2b8a",
+                            width=2.5
+                        ),
+                        hoverinfo="skip"
+                    )
+                )
+
+                # MŨI TÊN MOMENT ĐỒNG BỘ VỚI TẢI LỰC
+                # ===============================
+
+                xe = x_arc[-1]
+                ye = y_arc[-1]
+
+                # vector tiếp tuyến
+                tx = x_arc[-1] - x_arc[-3]
+                ty = y_arc[-1] - y_arc[-3]
+
+                # chuẩn hóa vector
+                length = math.sqrt(tx ** 2 + ty ** 2)
+
+                tx /= length
+                ty /= length
+
+                # vector pháp tuyến để tạo tam giác
+                nx = -ty
+                ny = tx
+
+                # SỬA LẠI KÍCH THƯỚC MŨI TÊN DẦM LIÊN TỤC TRÙNG PHIÊN BẢN CŨ
+                arrow_len = total_L * 0.018
+                arrow_w = total_L * 0.005
+
+                p1 = (xe, ye)
+
+                p2 = (
+                    xe - tx * arrow_len + nx * arrow_w,
+                    ye - ty * arrow_len + ny * arrow_w
+                )
+
+                p3 = (
+                    xe - tx * arrow_len - nx * arrow_w,
+                    ye - ty * arrow_len - ny * arrow_w
+                )
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=[p1[0], p2[0], p3[0], p1[0]],
+                        y=[p1[1], p2[1], p3[1], p1[1]],
+                        fill="toself",
+                        mode="lines",
+                        line=dict(
+                            color="#ff2b8a",
+                            width=1
+                        ),
+                        fillcolor="#ff2b8a",
+                        hoverinfo="skip"
+                    )
+                )
+                # trị số moment
+                fig.add_annotation(
+                    x=xm,
+                    y=y0 + r * 1.8,
+                    text=f"{M:.1f} kNm",
+                    showarrow=False,
+                    font=dict(
+                        size=10,
+                        color="#ff2b8a"
+                    )
+                )
+    return fig
+# ══════════════════════════════════════════════════════
+#  ── TAB 3: PLANE FRAME ──────────────────────────────
+# ══════════════════════════════════════════════════════
+
+def render_plane_frame() -> None:
+    # ==========================================
+    # GIAO DIỆN COMING SOON (ĐANG PHÁT TRIỂN)
+    # ==========================================
+    st.title("🏗️ Plane Frame (Khung Phẳng)")
+    st.success(
+        "**Plane Frame đã sẵn sàng tính toán.** Kết quả FEM được đối chiếu bằng nhân biểu đồ / Vereshchagin trong thuyết minh."
+    )
+
+    # Lệnh return này sẽ chặn không cho chạy đoạn code giao diện cũ ở bên dưới,
+    # giúp bạn giữ nguyên được source code mà không cần phải xóa hay comment (#) từng dòng.
+    st.caption("FEM 2D khung phẳng, kèm đối chiếu chuyển vị bằng nhân biểu đồ / Vereshchagin.")
+    # ==========================================
+
+    # --- TOÀN BỘ CODE CŨ DƯỚI ĐÂY ĐƯỢC GIỮ NGUYÊN ---
+    with st.sidebar:
+        st.header("⚙️ Plane Frame — Input")
+        if st.button("🆕 New Model", type="primary", use_container_width=True, key="pf_new_btn"):
+            # Quét sạch toàn bộ dữ liệu, bảng, kết quả của Tab Plane Frame
+            reset_keys_with_prefix("pf_")
+            st.rerun()
+        st.divider()
+
+    cfg = {"width": "stretch", "num_rows": "dynamic", "hide_index": True}
+
+    nodes_default = pd.DataFrame({"x (m)": [0.0, 0.0, 5.0, 5.0], "y (m)": [0.0, 4.0, 4.0, 0.0]})
+    elems_default = pd.DataFrame(
+        {"i": [0, 1, 3], "j": [1, 2, 2], "E": [200e6] * 3, "A": [0.01] * 3, "I": [1e-4] * 3,
+         "udl_local": [0.0] * 3})
+    sups_default = pd.DataFrame({"node": [0, 3], "Loại gối": ["Ngàm", "Ngàm"]})
+
+    tab_draw, tab_el, tab_sup, tab_pl_nd, tab_udl = st.tabs(
+        ["✏️ Vẽ khung", "🧱 Vật liệu & Tiết diện", "🔒 Supports", "⬇️ Node Loads", "📏 Element UDL"])
+
+    with tab_draw:
+        st.caption(
+            "Kéo chuột (hoặc chạm & kéo trên điện thoại/tablet) từ điểm này sang điểm khác để vẽ một thanh — "
+            "hệ thống tự bắt vào lưới hoặc vào nút có sẵn gần đó. Đổi chế độ bằng các nút phía trên canvas: "
+            "**🔒 Gối tựa** (bấm vào nút để đổi loại gối: Ngàm → Khớp → Di động ⊥Y → Di động ⊥X → không gối), "
+            "**↔️ Di chuyển nút** (kéo nút sang vị trí khác), **🗑️ Xoá** (bấm vào nút hoặc thanh cần xoá)."
+        )
+
+        cur_nodes_df = st.session_state.get("pf_nd_ed__data", nodes_default).reset_index(drop=True)
+        cur_el_df_draw = st.session_state.get("pf_el_ed__data", elems_default).reset_index(drop=True)
+        cur_sup_df_draw = st.session_state.get("pf_sup_ed__data", sups_default).reset_index(drop=True)
+
+        init_nodes = [
+            {"x": float(r["x (m)"]), "y": float(r["y (m)"])}
+            for _, r in cur_nodes_df.iterrows()
+            if pd.notna(r.get("x (m)")) and pd.notna(r.get("y (m)"))
+        ]
+        init_elems = [
+            {"i": int(r["i"]), "j": int(r["j"])}
+            for _, r in cur_el_df_draw.iterrows()
+            if pd.notna(r.get("i")) and pd.notna(r.get("j"))
+        ]
+        init_sups = []
+        for _, r in cur_sup_df_draw.iterrows():
+            if pd.isna(r.get("node")):
+                continue
+            ux, uy, rz = _pf_label_to_bool(r.get("Loại gối", "Ngàm"))
+            init_sups.append({"node": int(r["node"]), "ux": ux, "uy": uy, "rz": rz})
+
+        canvas_result = frame_canvas(
+            nodes=init_nodes, elements=init_elems, supports=init_sups,
+            snap=0.5, reset_token=_get_reset_cnt("pf_"), height=560, key="pf_frame_canvas",
+        )
+
+        if canvas_result is not None:
+            _sig = json.dumps(canvas_result, sort_keys=True)
+            if _sig != st.session_state.get("pf_canvas_last_sig"):
+                st.session_state["pf_canvas_last_sig"] = _sig
+
+                new_nodes_df = pd.DataFrame(
+                    [{"x (m)": n["x"], "y (m)": n["y"]} for n in canvas_result.get("nodes", [])],
+                    columns=["x (m)", "y (m)"],
+                )
+
+                old_props = {
+                    (int(r["i"]), int(r["j"])): (
+                        _safe_num(r.get("E"), 200e6), _safe_num(r.get("A"), 0.01),
+                        _safe_num(r.get("I"), 1e-4), _safe_num(r.get("udl_local"), 0.0),
+                    )
+                    for _, r in cur_el_df_draw.iterrows()
+                    if pd.notna(r.get("i")) and pd.notna(r.get("j"))
+                }
+                new_el_rows = []
+                for e in canvas_result.get("elements", []):
+                    props = old_props.get((e["i"], e["j"])) or old_props.get((e["j"], e["i"]))
+                    E, A, I, udl = props if props else (200e6, 0.01, 1e-4, 0.0)
+                    new_el_rows.append({"i": e["i"], "j": e["j"], "E": E, "A": A, "I": I, "udl_local": udl})
+                new_el_df = pd.DataFrame(new_el_rows, columns=["i", "j", "E", "A", "I", "udl_local"])
+
+                new_sup_rows = [
+                    {"node": s["node"], "Loại gối": _PF_TYPE_TO_LABEL.get(_pf_support_type(s), "Ngàm")}
+                    for s in canvas_result.get("supports", [])
+                ]
+                new_sup_df = pd.DataFrame(new_sup_rows, columns=["node", "Loại gối"])
+
+                pf_set_table("pf_nd_ed", new_nodes_df)
+                pf_set_table("pf_el_ed", new_el_df)
+                pf_set_table("pf_sup_ed", new_sup_df)
+                st.rerun()
+
+        with st.expander("🔢 Nhập / sửa toạ độ nút bằng số (tuỳ chọn, cho ai cần độ chính xác tuyệt đối)",
+                          expanded=False):
+            df_nodes = safe_data_editor("pf_nd_ed", nodes_default, **cfg)
+
+        st.caption(
+            f"Hiện có: **{len(cur_nodes_df.dropna())} nút** · "
+            f"**{len(cur_el_df_draw.dropna(subset=['i']))} thanh** · "
+            f"**{len(cur_sup_df_draw.dropna(subset=['node']))} gối tựa**."
+        )
+
+
+    with tab_el:
+        # Tham chiếu nhanh toạ độ node — đỡ phải lật qua tab Vẽ khung khi kiểm tra i, j
+        if df_nodes is not None and not df_nodes.empty:
+            node_ref = " · ".join(
+                f"N{idx}=({r['x (m)']:.2f}, {r['y (m)']:.2f})"
+                for idx, r in df_nodes.reset_index(drop=True).iterrows()
+                if pd.notna(r.get("x (m)")) and pd.notna(r.get("y (m)"))
+            )
+            if node_ref:
+                st.caption(f"🔵 Toạ độ node hiện có (i, j bên dưới tham chiếu đến đây): {node_ref}")
+
+        with st.expander("🧱 Gán nhanh vật liệu & tiết diện (tự tính A, I — khỏi tra bảng, khỏi tính tay)",
+                          expanded=False):
+            st.caption(
+                "Chọn vật liệu và loại tiết diện, nhập kích thước theo cm — chương trình tự tính "
+                "diện tích A (m²) và mô-men quán tính I (m⁴) rồi gán vào các phần tử bạn chọn."
+            )
+
+            cur_el_df = st.session_state.get("pf_el_ed__data", elems_default).reset_index(drop=True)
+            n_el = len(cur_el_df)
+            el_options = [
+                f"E{k} (node {int(cur_el_df.iloc[k]['i'])}→{int(cur_el_df.iloc[k]['j'])})"
+                if pd.notna(cur_el_df.iloc[k].get("i")) else f"E{k}"
+                for k in range(n_el)
+            ]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                mat_name = st.selectbox("Vật liệu", list(PF_MATERIALS.keys()), key="pf_mat_sel")
+            with c2:
+                sec_type = st.selectbox("Loại tiết diện", PF_SECTION_TYPES, key="pf_sec_sel")
+
+            if mat_name == "Tùy chỉnh":
+                E_val = st.number_input("E tự nhập (kN/m²)", min_value=0.0, value=200e6,
+                                         format="%.0f", key="pf_E_custom")
+            else:
+                E_val = PF_MATERIALS[mat_name]
+                st.caption(f"E = {E_val:,.0f} kN/m² — giá trị tham khảo, đối chiếu lại theo tiêu chuẩn "
+                           f"thiết kế bạn đang áp dụng trước khi dùng cho hồ sơ chính thức.")
+
+            dims: dict = {}
+            A_val = I_val = None
+            if sec_type == "Chữ nhật đặc":
+                d1, d2 = st.columns(2)
+                b_cm = d1.number_input("Bề rộng b (cm)", min_value=0.0, value=20.0, key="pf_b_cm")
+                h_cm = d2.number_input("Chiều cao h (cm)", min_value=0.0, value=30.0, key="pf_h_cm")
+                dims = {"b": b_cm / 100.0, "h": h_cm / 100.0}
+            elif sec_type == "Tròn đặc":
+                d_cm = st.number_input("Đường kính D (cm)", min_value=0.0, value=30.0, key="pf_d_cm")
+                dims = {"d": d_cm / 100.0}
+            elif sec_type == "Ống tròn (rỗng)":
+                d1, d2 = st.columns(2)
+                d_cm = d1.number_input("Đường kính ngoài D (cm)", min_value=0.0, value=30.0, key="pf_dout_cm")
+                t_cm = d2.number_input("Bề dày t (cm)", min_value=0.0, value=1.0, key="pf_tpipe_cm")
+                dims = {"d_out": d_cm / 100.0, "t": t_cm / 100.0}
+            elif sec_type == "Hộp chữ nhật (rỗng)":
+                d1, d2, d3 = st.columns(3)
+                b_cm = d1.number_input("Bề rộng b (cm)", min_value=0.0, value=30.0, key="pf_bbox_cm")
+                h_cm = d2.number_input("Chiều cao h (cm)", min_value=0.0, value=40.0, key="pf_hbox_cm")
+                t_cm = d3.number_input("Bề dày thành t (cm)", min_value=0.0, value=1.0, key="pf_tbox_cm")
+                dims = {"b": b_cm / 100.0, "h": h_cm / 100.0, "t": t_cm / 100.0}
+            else:  # Nhập trực tiếp A, I
+                d1, d2 = st.columns(2)
+                A_val = d1.number_input("Diện tích A (m²)", min_value=0.0, value=0.01,
+                                         format="%.5f", key="pf_A_direct")
+                I_val = d2.number_input("Mô-men quán tính I (m⁴)", min_value=0.0, value=1e-4,
+                                         format="%.6f", key="pf_I_direct")
+
+            if sec_type != "Nhập trực tiếp A, I":
+                props = pf_section_props(sec_type, dims)
+                if props is not None:
+                    A_val, I_val = props
+
+            if A_val is not None and I_val is not None:
+                st.markdown(f"**→ A = {A_val:.5f} m²&nbsp;&nbsp;&nbsp; I = {I_val:.6f} m⁴**")
+            else:
+                st.warning("Kích thước chưa hợp lệ (phải lớn hơn 0).")
+
+            sel_elems = st.multiselect(
+                "Áp dụng cho phần tử nào?", options=list(range(n_el)),
+                format_func=lambda k: el_options[k], default=list(range(n_el)), key="pf_sec_targets",
+            )
+
+            if st.button("✅ Áp dụng E, A, I cho phần tử đã chọn", key="pf_apply_section",
+                         disabled=(A_val is None or I_val is None or E_val is None or not sel_elems)):
+                new_df = cur_el_df.copy()
+                for k in sel_elems:
+                    new_df.loc[k, "E"] = E_val
+                    new_df.loc[k, "A"] = A_val
+                    new_df.loc[k, "I"] = I_val
+                pf_set_table("pf_el_ed", new_df)
+                st.success(f"Đã gán E, A, I cho {len(sel_elems)} phần tử.")
+                st.rerun()
+
+        df_el = safe_data_editor("pf_el_ed", elems_default, **cfg)
+        st.caption("Bảng trên vẫn có thể sửa trực tiếp (kể cả thêm/xoá dòng, khai báo i, j) — "
+                   "panel phía trên chỉ là cách gán nhanh E, A, I, không bắt buộc phải dùng.")
+
+    with tab_sup:
+        st.caption(
+            "Chỉ cần chọn **1 loại gối** cho mỗi nút (Ngàm / Khớp / Di động ⊥Y / Di động ⊥X) — "
+            "bảng này đồng bộ 2 chiều với thao tác **🔒 Gối tựa** trên canvas ở tab Vẽ khung, "
+            "đổi ở bên nào cũng ra kết quả giống nhau nên không cần khai báo lại lần thứ hai."
+        )
+        sup_cfg = {
+            "width": "stretch",
+            "num_rows": "dynamic",
+            "hide_index": True,
+            "column_config": {
+                "Loại gối": st.column_config.SelectboxColumn(
+                    "Loại gối", options=PF_SUPPORT_LABELS, required=True, default="Ngàm",
+                ),
+            },
+        }
+        df_sup_label = safe_data_editor("pf_sup_ed", sups_default, **sup_cfg)
+        # Suy ra ux, uy, rz từ nhãn "Loại gối" — để phần tính toán / vẽ hình phía
+        # dưới (đang đọc ux, uy, rz) không cần sửa gì, chỉ người dùng nhìn thấy 1 lựa chọn duy nhất.
+        df_sup = _pf_sup_with_bool_cols(df_sup_label)
+
+    with tab_pl_nd:
+        nloads_default = pd.DataFrame(
+            {"node": pd.Series(dtype=int), "Fx (kN)": pd.Series(dtype=float), "Fy (kN)": pd.Series(dtype=float),
+             "Mz (kNm)": pd.Series(dtype=float)})
+        df_nload = safe_data_editor("pf_nl_ed", nloads_default, **cfg)
+
+    with tab_udl:
+        st.caption(
+            "Gán tải phân bố đều (UDL) lên phần tử — chọn phần tử, nhập q, bấm nút, khỏi phải gõ tay "
+            "vào từng ô của bảng Elements. Quy ước: q dương theo chiều trục y cục bộ của phần tử "
+            "(vuông góc trục thanh, xác định theo quy tắc bàn tay phải kể từ trục x cục bộ hướng node i→j)."
+        )
+
+        cur_el_df2 = st.session_state.get("pf_el_ed__data", elems_default).reset_index(drop=True)
+        n_el2 = len(cur_el_df2)
+
+        if n_el2 == 0:
+            st.info("Chưa có phần tử nào — khai báo phần tử ở tab 📐 Elements trước.")
+        else:
+            el_options2 = [
+                f"E{k} (node {int(cur_el_df2.iloc[k]['i'])}→{int(cur_el_df2.iloc[k]['j'])}, "
+                f"hiện tại q = {_safe_num(cur_el_df2.iloc[k].get('udl_local')):g} kN/m)"
+                if pd.notna(cur_el_df2.iloc[k].get("i")) else f"E{k}"
+                for k in range(n_el2)
+            ]
+
+            sel_udl = st.multiselect("Chọn phần tử cần gán tải", options=list(range(n_el2)),
+                                      format_func=lambda k: el_options2[k], key="pf_udl_targets")
+            q_val = st.number_input("Giá trị q (kN/m)", value=0.0, step=0.5, key="pf_udl_val")
+
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("⬇️ Gán tải cho phần tử đã chọn", key="pf_apply_udl",
+                             use_container_width=True, disabled=not sel_udl):
+                    new_df = cur_el_df2.copy()
+                    for k in sel_udl:
+                        new_df.loc[k, "udl_local"] = q_val
+                    pf_set_table("pf_el_ed", new_df)
+                    st.success(f"Đã gán q = {q_val:g} kN/m cho {len(sel_udl)} phần tử.")
+                    st.rerun()
+            with b2:
+                if st.button("🧹 Xoá tải trên phần tử đã chọn", key="pf_clear_udl",
+                             use_container_width=True, disabled=not sel_udl):
+                    new_df = cur_el_df2.copy()
+                    for k in sel_udl:
+                        new_df.loc[k, "udl_local"] = 0.0
+                    pf_set_table("pf_el_ed", new_df)
+                    st.success(f"Đã xoá tải trên {len(sel_udl)} phần tử.")
+                    st.rerun()
+
+            st.divider()
+            st.caption("Tổng hợp UDL hiện tại theo từng phần tử:")
+            st.dataframe(
+                pd.DataFrame({
+                    "Phần tử": [f"E{k}" for k in range(n_el2)],
+                    "i → j": [
+                        f"{int(cur_el_df2.iloc[k]['i'])} → {int(cur_el_df2.iloc[k]['j'])}"
+                        if pd.notna(cur_el_df2.iloc[k].get("i")) else "-"
+                        for k in range(n_el2)
+                    ],
+                    "udl_local (kN/m)": [_safe_num(cur_el_df2.iloc[k].get("udl_local")) for k in range(n_el2)],
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    result_pf: PlaneFrameResult | None = st.session_state.get("pf_result")
+
+    if st.button("▶ Solve", type="primary", use_container_width=True, key="pf_solve"):
+        try:
+            nodes = [FrameNode(x=float(r["x (m)"]), y=float(r["y (m)"])) for _, r in df_nodes.iterrows() if
+                     pd.notna(r.get("x (m)")) and pd.notna(r.get("y (m)"))]
+            elems = [
+                FrameElement(i_node=int(r["i"]), j_node=int(r["j"]), E=float(r["E"]), A=float(r["A"]), I=float(r["I"]),
+                             udl_local=float(r.get("udl_local", 0) or 0)) for _, r in df_el.iterrows() if
+                pd.notna(r.get("i"))]
+            sups = [
+                FrameSupport(node=int(r["node"]), ux_fixed=bool(r.get("ux", True)), uy_fixed=bool(r.get("uy", True)),
+                             rz_fixed=bool(r.get("rz", True))) for _, r in df_sup.iterrows() if pd.notna(r.get("node"))]
+            pls = [FramePointLoad(node=int(r["node"]), Fx=float(r.get("Fx (kN)", 0) or 0),
+                                  Fy=float(r.get("Fy (kN)", 0) or 0), Mz=float(r.get("Mz (kNm)", 0) or 0)) for _, r in
+                   df_nload.iterrows() if pd.notna(r.get("node"))]
+
+            pf_input = PlaneFrameInput(nodes=nodes, elements=elems, supports=sups, point_loads=pls)
+            st.session_state.pf_result = solve_plane_frame(pf_input)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+
+    if result_pf is None:
+        metric_html([("Nodes", str(len(df_nodes))), ("Elements", str(len(df_el))), ("Supports", str(len(df_sup))),
+                     ("Status", "Ready")])
+    else:
+        all_V = np.concatenate([er.shear for er in result_pf.element_results])
+        all_M = np.concatenate([er.moment for er in result_pf.element_results])
+        all_N = np.concatenate([er.axial for er in result_pf.element_results])
+        if getattr(result_pf, "vereshchagin_checks", None):
+            cmp_df = pd.DataFrame([
+                {
+                    "Node": c["node"],
+                    "DOF": c["component"],
+                    "FEM": c["fem"],
+                    "Vereshchagin": c["vereshchagin"],
+                    "Diff": c["diff"],
+                }
+                for c in result_pf.vereshchagin_checks
+            ])
+            st.subheader("Đối chiếu FEM - Vereshchagin")
+            st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+        metric_html([
+            ("Nmax/Nmin", f"{np.max(all_N):.2f}/{np.min(all_N):.2f} kN"),
+            ("Vmax", f"{np.max(np.abs(all_V)):.3f} kN"),
+            ("Mmax", f"{np.max(np.abs(all_M)):.3f} kNm"),
+            ("Reactions", f"{len(result_pf.reactions)} gối"),
+        ])
+
+    left, right = st.columns([1.7, 1], gap="large")
+    with left:
+        a, b = st.columns(2)
+        with a: st.plotly_chart(_pf_geometry_plot(df_nodes, df_el, df_sup, result_pf, df_nload), use_container_width=True)
+        with b: st.plotly_chart(_pf_frame_diagram(df_nodes, df_el, df_sup, result_pf, "moment", "BMD (kNm)"), use_container_width=True)
+        c, d = st.columns(2)
+        with c: st.plotly_chart(_pf_frame_diagram(df_nodes, df_el, df_sup, result_pf, "shear", "SFD (kN)"), use_container_width=True)
+        with d: st.plotly_chart(_pf_frame_diagram(df_nodes, df_el, df_sup, result_pf, "axial", "AFD (kN)"), use_container_width=True)
+    with right:
+
+        figures = []
+
+        if result_pf:
+            fig_geom = _pf_geometry_plot(
+                df_nodes,
+                df_el,
+                df_sup,
+                result_pf,
+                df_nload,
+            )
+
+            fig_bmd = _pf_frame_diagram(
+                df_nodes, df_el, df_sup, result_pf,
+                "moment",
+                "BMD (kNm)",
+            )
+
+            fig_sfd = _pf_frame_diagram(
+                df_nodes, df_el, df_sup, result_pf,
+                "shear",
+                "SFD (kN)",
+            )
+
+            fig_afd = _pf_frame_diagram(
+                df_nodes, df_el, df_sup, result_pf,
+                "axial",
+                "AFD (kN)",
+            )
+
+            figures.extend([
+                ("Geometry", fig_geom),
+                ("Bending Moment Diagram", fig_bmd),
+                ("Shear Force Diagram", fig_sfd),
+                ("Axial Force Diagram", fig_afd),
+            ])
+
+        report_panel(
+            result_pf.report if result_pf else None,
+            "Thuyết Minh — Khung Phẳng",
+            "plane_frame",
+            figures=figures
+        )
+PF_SUPPORT_LABELS = ["Ngàm", "Khớp", "Di động ⊥Y", "Di động ⊥X"]
+
+_PF_LABEL_TO_TYPE = {
+    "Ngàm": "FIXED",
+    "Khớp": "PIN",
+    "Di động ⊥Y": "ROLX",
+    "Di động ⊥X": "ROLY",
+}
+_PF_TYPE_TO_LABEL = {v: k for k, v in _PF_LABEL_TO_TYPE.items()}
+_PF_TYPE_TO_BOOL = {
+    "FIXED": (True, True, True),
+    "PIN": (True, True, False),
+    "ROLX": (False, True, False),
+    "ROLY": (True, False, False),
+}
+
+
+def _pf_label_to_bool(label) -> tuple[bool, bool, bool]:
+    """Quy đổi nhãn 'Loại gối' (Ngàm/Khớp/Di động ⊥Y/Di động ⊥X) sang 3 cờ ux, uy, rz."""
+    t = _PF_LABEL_TO_TYPE.get(str(label).strip(), "FIXED")
+    return _PF_TYPE_TO_BOOL[t]
+
+
+def _pf_sup_with_bool_cols(df_sup: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bổ sung 3 cột ux, uy, rz (suy ra từ cột 'Loại gối' thân thiện với người
+    dùng) vào bảng Supports, để toàn bộ phần tính toán FEM / vẽ hình phía sau
+    (đang đọc ux, uy, rz) không cần sửa gì thêm — người dùng chỉ khai báo
+    ĐÚNG MỘT LẦN, bằng đúng MỘT nhãn duy nhất, ở canvas hoặc ở bảng đều được.
+    """
+    if df_sup is None or df_sup.empty:
+        return df_sup
+    out = df_sup.copy()
+    if "Loại gối" in out.columns:
+        bools = out["Loại gối"].apply(_pf_label_to_bool)
+        out["ux"] = [b[0] for b in bools]
+        out["uy"] = [b[1] for b in bools]
+        out["rz"] = [b[2] for b in bools]
+    return out
+
+
+def _pf_support_type(row) -> str:
+    """
+    Xác định loại gối tựa từ 3 cờ ràng buộc (ux, uy, rz) của bảng Supports,
+    dùng chung quy ước với canvas vẽ khung (xem hàm JS boolToType):
+      - FIXED : ux, uy, rz đều bị ràng buộc      -> ngàm cứng
+      - PIN   : ux, uy bị ràng buộc, rz tự do    -> khớp cố định
+      - ROLX  : chỉ uy bị ràng buộc (ux tự do)   -> gối di động, trượt ngang
+      - ROLY  : chỉ ux bị ràng buộc (uy tự do)   -> gối di động, trượt đứng
+    """
+    ux = bool(row.get("ux", False))
+    uy = bool(row.get("uy", False))
+    rz = bool(row.get("rz", False))
+
+    if ux and uy and rz:
+        return "FIXED"
+    if ux and uy and not rz:
+        return "PIN"
+    if not ux and uy:
+        return "ROLX"
+    if ux and not uy:
+        return "ROLY"
+    return "PIN"  # trường hợp không xác định -> mặc định vẽ như khớp cố định
+
+
+def draw_support_pf(fig: go.Figure, x: float, y: float, sup_type: str, size: float) -> None:
+    """
+    Vẽ ký hiệu gối tựa tại node (x, y) của khung phẳng, ĐỒNG BỘ phong cách
+    vẽ với các tab Dầm đơn / Dầm liên tục (tam giác đặc cho khớp, chấm
+    tròn + gạch chân cho gối di động, hình chữ nhật đặc có gạch hatch cho
+    ngàm cứng) — dùng chung màu COLOR_SUP.
+    """
+    h = size * 1.15   # chiều cao tam giác / khoảng lùi gối
+    w = size * 0.95   # nửa bề rộng đáy tam giác
+    floor = size * 1.5
+
+    if sup_type == "FIXED":
+        fig.add_shape(
+            type="rect",
+            x0=x - size, x1=x + size,
+            y0=y - size * 0.4, y1=y,
+            fillcolor=COLOR_SUP, line={"color": COLOR_SUP},
+        )
+        for k in range(-2, 3):
+            xk = x + k * size * 0.4
+            fig.add_trace(go.Scatter(
+                x=[xk, xk - size * 0.25], y=[y - size * 0.4, y - size * 0.8],
+                mode="lines", line=dict(color=COLOR_SUP, width=1.2),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+    elif sup_type == "PIN":
+        fig.add_trace(go.Scatter(
+            x=[x, x + w, x - w, x], y=[y, y - h, y - h, y],
+            fill="toself", mode="lines",
+            line={"color": COLOR_SUP, "width": 1.5}, fillcolor=COLOR_SUP,
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x - w * 1.3, x + w * 1.3], y=[y - h, y - h],
+            mode="lines", line=dict(color=COLOR_SUP, width=2),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    elif sup_type == "ROLX":  # ngăn chuyển vị đứng, tự do trượt ngang
+        y_top, y_bot, y_floor = y - size * 0.25, y - size * 1.05, y - floor
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y_top], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y_bot], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x, x], y=[y_top, y_bot], mode="lines",
+            line=dict(color=COLOR_SUP, width=1.5),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x - w, x + w], y=[y_floor, y_floor], mode="lines",
+            line=dict(color=COLOR_SUP, width=2),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    else:  # ROLY: ngăn chuyển vị ngang, tự do trượt đứng (xoay 90° so với ROLX)
+        x_top, x_bot, x_floor = x - size * 0.25, x - size * 1.05, x - floor
+        fig.add_trace(go.Scatter(
+            x=[x_top], y=[y], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x_bot], y=[y], mode="markers",
+            marker=dict(symbol="circle", size=7, color=COLOR_SUP),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x_top, x_bot], y=[y, y], mode="lines",
+            line=dict(color=COLOR_SUP, width=1.5),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[x_floor, x_floor], y=[y - w, y + w], mode="lines",
+            line=dict(color=COLOR_SUP, width=2),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+
+def _pf_geometry_plot(
+    df_nodes: pd.DataFrame,
+    df_el: pd.DataFrame,
+    df_sup: pd.DataFrame,
+    result_pf=None,
+    df_nload: pd.DataFrame | None = None,
+) -> go.Figure:
+    """
+    Vẽ hình học khung phẳng 2D.
+
+    Parameters
+    ----------
+    df_nodes : DataFrame
+        Bảng Nodes gồm:
+        - x (m)
+        - y (m)
+
+    df_el : DataFrame
+        Bảng Elements gồm:
+        - i
+        - j
+
+    df_sup : DataFrame
+        Bảng Supports gồm:
+        - node
+        - ux
+        - uy
+        - rz
+
+    result_pf : PlaneFrameResult, optional
+        Kết quả FEM. Hiện tại dùng để giữ tương thích
+        với giao diện và có thể mở rộng sau này.
+
+    df_nload : DataFrame, optional
+        Bảng Node Loads gồm: node, Fx (kN), Fy (kN), Mz (kNm).
+        Dùng để vẽ mũi tên lực / mô-men gán vào node.
+    """
+
+    fig = go.Figure()
+
+    # ==========================================================
+    # 1. KIỂM TRA DỮ LIỆU NODES
+    # ==========================================================
+
+    if df_nodes is None or df_nodes.empty:
+        fig.update_layout(
+            title="Plane Frame Geometry",
+            xaxis_title="X (m)",
+            yaxis_title="Y (m)",
+            template="plotly_white",
+        )
+        return fig
+
+    nodes = df_nodes.copy()
+
+    # Đảm bảo tên cột tồn tại
+    required_node_cols = ["x (m)", "y (m)"]
+
+    if not all(c in nodes.columns for c in required_node_cols):
+        fig.update_layout(
+            title="Plane Frame Geometry — Invalid Node Data",
+            template="plotly_white",
+        )
+        return fig
+
+    # Ép kiểu số
+    nodes["x (m)"] = pd.to_numeric(
+        nodes["x (m)"],
+        errors="coerce"
+    )
+
+    nodes["y (m)"] = pd.to_numeric(
+        nodes["y (m)"],
+        errors="coerce"
+    )
+
+    nodes = nodes.dropna(
+        subset=["x (m)", "y (m)"]
+    ).reset_index(drop=True)
+
+    # ==========================================================
+    # 2. VẼ ELEMENTS
+    # ==========================================================
+
+    if df_el is not None and not df_el.empty:
+
+        elements = df_el.copy()
+
+        if "i" in elements.columns and "j" in elements.columns:
+
+            for _, row in elements.iterrows():
+
+                try:
+                    i = int(row["i"])
+                    j = int(row["j"])
+
+                    if (
+                        i < 0
+                        or j < 0
+                        or i >= len(nodes)
+                        or j >= len(nodes)
+                    ):
+                        continue
+
+                    xi = float(nodes.loc[i, "x (m)"])
+                    yi = float(nodes.loc[i, "y (m)"])
+
+                    xj = float(nodes.loc[j, "x (m)"])
+                    yj = float(nodes.loc[j, "y (m)"])
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[xi, xj],
+                            y=[yi, yj],
+                            mode="lines",
+                            line=dict(
+                                color="#1f77b4",
+                                width=4,
+                            ),
+                            hovertemplate=(
+                                f"Element: {i} → {j}"
+                                "<br>X: %{x:.3f} m"
+                                "<br>Y: %{y:.3f} m"
+                                "<extra></extra>"
+                            ),
+                            showlegend=False,
+                        )
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    IndexError,
+                ):
+                    continue
+
+    # ==========================================================
+    # 2b. VẼ TẢI PHÂN BỐ ĐỀU (UDL) TRÊN TỪNG PHẦN TỬ
+    # ==========================================================
+    # FIX: UDL đã được gán ở bảng Elements (cột udl_local) và đã tính đúng
+    # trong bước Solve, nhưng trước đây KHÔNG BAO GIỜ được vẽ lên hình học
+    # -> người dùng gán tải mà không thấy nó nằm ở đâu. Bổ sung dải tải +
+    # mũi tên dọc theo phần tử, đồng bộ màu xanh lá với quy ước UDL của
+    # 2 tab Dầm (Single Beam / Continuous Beam).
+    #
+    # Quy ước: q dương theo chiều trục y cục bộ của phần tử — trục y cục bộ
+    # được xác định bằng cách quay trục x cục bộ (hướng từ node i -> j)
+    # 90° ngược chiều kim đồng hồ (quy tắc bàn tay phải).
+
+    if (
+        df_el is not None and not df_el.empty
+        and "i" in df_el.columns and "j" in df_el.columns
+        and "udl_local" in df_el.columns
+    ):
+
+        x_span_u = float(nodes["x (m)"].max() - nodes["x (m)"].min()) if len(nodes) else 0.0
+        y_span_u = float(nodes["y (m)"].max() - nodes["y (m)"].min()) if len(nodes) else 0.0
+        L_off = max(max(x_span_u, y_span_u) * 0.12, 0.35)
+
+        for _, row in df_el.iterrows():
+            try:
+                i = int(row["i"])
+                j = int(row["j"])
+
+                q = row.get("udl_local")
+                q = float(q) if q not in (None, "") and pd.notna(q) else 0.0
+                if abs(q) < 1e-9:
+                    continue
+
+                if i < 0 or j < 0 or i >= len(nodes) or j >= len(nodes):
+                    continue
+
+                xi, yi = float(nodes.loc[i, "x (m)"]), float(nodes.loc[i, "y (m)"])
+                xj, yj = float(nodes.loc[j, "x (m)"]), float(nodes.loc[j, "y (m)"])
+
+                dx, dy = xj - xi, yj - yi
+                L = math.hypot(dx, dy)
+                if L < 1e-9:
+                    continue
+
+                tx, ty = dx / L, dy / L        # trục x cục bộ (i -> j)
+                nx, ny = -ty, tx                # trục y cục bộ (quay 90° ngược kim đồng hồ — khớp T trong fem_core._rotation_matrix)
+                sign = 1.0 if q > 0 else -1.0
+                # Mũi tên phải TRỎ THEO chiều lực (kết thúc tại thanh), nên điểm gốc (đuôi mũi tên)
+                # nằm ở phía NGƯỢC với chiều +local_y*sign(q); dải tải tô mờ cũng đặt cùng phía đuôi mũi tên.
+                ox, oy = -nx * L_off * sign, -ny * L_off * sign
+
+                # Dải tải phân bố (vùng tô mờ)
+                fig.add_trace(
+                    go.Scatter(
+                        x=[xi, xj, xj + ox, xi + ox, xi],
+                        y=[yi, yj, yj + oy, yi + oy, yi],
+                        fill="toself",
+                        mode="lines",
+                        line=dict(color="#28a745", width=1),
+                        fillcolor="rgba(40,167,69,0.15)",
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+
+                # Mũi tên phân bố dọc theo phần tử, hướng vào thanh
+                n_arrows = max(3, int(L / 0.9))
+                for k in range(n_arrows + 1):
+                    tt = k / n_arrows
+                    px_, py_ = xi + tx * L * tt, yi + ty * L * tt
+                    fig.add_annotation(
+                        x=px_, y=py_,
+                        ax=px_ + ox, ay=py_ + oy,
+                        axref="x", ayref="y",
+                        showarrow=True,
+                        arrowhead=2, arrowsize=0.9, arrowwidth=1.6,
+                        arrowcolor="#28a745",
+                        text="",
+                    )
+
+                # Nhãn giá trị q tại điểm giữa
+                xm, ym = (xi + xj) / 2 + ox, (yi + yj) / 2 + oy
+                fig.add_annotation(
+                    x=xm, y=ym,
+                    text=f"q={q:g} kN/m",
+                    showarrow=False,
+                    font=dict(size=11, color="#168f2c"),
+                    bgcolor="rgba(255,255,255,0.85)",
+                )
+
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+
+    # ==========================================================
+    # 3. VẼ NODES
+    # ==========================================================
+
+    fig.add_trace(
+        go.Scatter(
+            x=nodes["x (m)"],
+            y=nodes["y (m)"],
+            mode="markers+text",
+            text=[
+                f"N{i}"
+                for i in range(len(nodes))
+            ],
+            textposition="top center",
+            textfont=dict(size=12, color="#ffffff"),
+            marker=dict(
+                size=10,
+                color="#ffffff",
+                line=dict(
+                    color="#1f77b4",
+                    width=2,
+                ),
+            ),
+            name="Nodes",
+            hovertemplate=(
+                "Node: %{text}"
+                "<br>X: %{x:.3f} m"
+                "<br>Y: %{y:.3f} m"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # ==========================================================
+    # 4. VẼ GỐI TỰA
+    # ==========================================================
+
+    if df_sup is not None and not df_sup.empty:
+
+        supports = df_sup.copy()
+
+        if "node" in supports.columns:
+
+            # Kích thước ký hiệu gối tỷ lệ theo bao hình học của khung,
+            # cùng cách tính với _cb_draw_base_beam_and_supports để đồng bộ
+            x_span_sup = float(nodes["x (m)"].max() - nodes["x (m)"].min()) if len(nodes) else 0.0
+            y_span_sup = float(nodes["y (m)"].max() - nodes["y (m)"].min()) if len(nodes) else 0.0
+            sup_size = max(max(x_span_sup, y_span_sup) * 0.035, 0.25)
+
+            for _, row in supports.iterrows():
+
+                try:
+                    node_id = int(row["node"])
+
+                    if (
+                        node_id < 0
+                        or node_id >= len(nodes)
+                    ):
+                        continue
+
+                    x = float(
+                        nodes.loc[node_id, "x (m)"]
+                    )
+
+                    y = float(
+                        nodes.loc[node_id, "y (m)"]
+                    )
+
+                    sup_type = _pf_support_type(row)
+                    draw_support_pf(fig, x, y, sup_type, sup_size)
+
+                except (
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    IndexError,
+                ):
+                    continue
+
+    # ==========================================================
+    # 5. ĐÁNH SỐ ELEMENT
+    # ==========================================================
+
+    if df_el is not None and not df_el.empty:
+
+        elements = df_el.copy()
+
+        if "i" in elements.columns and "j" in elements.columns:
+
+            for e_id, row in elements.iterrows():
+
+                try:
+                    i = int(row["i"])
+                    j = int(row["j"])
+
+                    if (
+                        i < 0
+                        or j < 0
+                        or i >= len(nodes)
+                        or j >= len(nodes)
+                    ):
+                        continue
+
+                    xi = float(nodes.loc[i, "x (m)"])
+                    yi = float(nodes.loc[i, "y (m)"])
+
+                    xj = float(nodes.loc[j, "x (m)"])
+                    yj = float(nodes.loc[j, "y (m)"])
+
+                    xm = (xi + xj) / 2
+                    ym = (yi + yj) / 2
+
+                    fig.add_annotation(
+                        x=xm,
+                        y=ym,
+                        text=f"E{e_id}",
+                        showarrow=False,
+                        font=dict(
+                            size=12,
+                            color="#111111",
+                        ),
+                        bgcolor="rgba(255,255,255,0.75)",
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    IndexError,
+                ):
+                    continue
+
+    # ==========================================================
+    # 5b. VE TAI TRONG GAN VAO NODE (Fx, Fy, Mz)
+    # ==========================================================
+    # FIX: truoc day ham nay khong nhan df_nload nen tai trong da gan
+    # o tab "Node Loads" khong bao gio duoc ve len hinh, du da tinh
+    # dung o buoc Solve.
+
+    if df_nload is not None and not df_nload.empty and "node" in df_nload.columns:
+
+        x_span = float(nodes["x (m)"].max() - nodes["x (m)"].min()) if len(nodes) else 0.0
+        y_span = float(nodes["y (m)"].max() - nodes["y (m)"].min()) if len(nodes) else 0.0
+        L_arrow = max(x_span, y_span, 1.0) * 0.18
+
+        for _, row in df_nload.iterrows():
+
+            try:
+                node_id = row.get("node")
+                if node_id is None or pd.isna(node_id):
+                    continue
+                node_id = int(node_id)
+
+                if node_id < 0 or node_id >= len(nodes):
+                    continue
+
+                x0 = float(nodes.loc[node_id, "x (m)"])
+                y0 = float(nodes.loc[node_id, "y (m)"])
+
+                fx = row.get("Fx (kN)")
+                fy = row.get("Fy (kN)")
+                mz = row.get("Mz (kNm)")
+
+                fx = float(fx) if fx not in (None, "") and pd.notna(fx) else 0.0
+                fy = float(fy) if fy not in (None, "") and pd.notna(fy) else 0.0
+                mz = float(mz) if mz not in (None, "") and pd.notna(mz) else 0.0
+
+                if fx != 0.0:
+                    sign = 1.0 if fx > 0 else -1.0
+                    fig.add_annotation(
+                        x=x0, y=y0,
+                        ax=x0 - sign * L_arrow, ay=y0,
+                        axref="x", ayref="y",
+                        showarrow=True,
+                        arrowhead=3, arrowsize=1.1, arrowwidth=2.2,
+                        arrowcolor=COLOR_SFD,
+                        text="",
+                    )
+                    fig.add_annotation(
+                        x=x0 - sign * L_arrow, y=y0,
+                        text=f"Fx={fx:g} kN",
+                        showarrow=False,
+                        font=dict(size=11, color=COLOR_SFD),
+                        bgcolor="rgba(255,255,255,0.8)",
+                        yshift=12,
+                    )
+
+                if fy != 0.0:
+                    sign = 1.0 if fy > 0 else -1.0
+                    fig.add_annotation(
+                        x=x0, y=y0,
+                        ax=x0, ay=y0 - sign * L_arrow,
+                        axref="x", ayref="y",
+                        showarrow=True,
+                        arrowhead=3, arrowsize=1.1, arrowwidth=2.2,
+                        arrowcolor=COLOR_SFD,
+                        text="",
+                    )
+                    fig.add_annotation(
+                        x=x0, y=y0 - sign * L_arrow,
+                        text=f"Fy={fy:g} kN",
+                        showarrow=False,
+                        font=dict(size=11, color=COLOR_SFD),
+                        bgcolor="rgba(255,255,255,0.8)",
+                        xshift=32,
+                    )
+
+                if mz != 0.0:
+                    symbol = "↻" if mz < 0 else "↺"  # chieu kim / nguoc kim theo dau quy uoc
+                    fig.add_annotation(
+                        x=x0, y=y0,
+                        text=f"{symbol} Mz={mz:g} kNm",
+                        showarrow=False,
+                        font=dict(size=11, color="#ff2b8a"),
+                        bgcolor="rgba(255,255,255,0.8)",
+                        xshift=-6,
+                        yshift=-18,
+                    )
+
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+
+    # ==========================================================
+    # 6. LAYOUT
+    # ==========================================================
+
+    fig.update_layout(
+        title="Plane Frame Geometry",
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        template="plotly_white",
+        height=500,
+        margin=dict(
+            l=50,
+            r=30,
+            t=60,
+            b=50,
+        ),
+        xaxis=dict(
+            zeroline=True,
+            showgrid=True,
+        ),
+        yaxis=dict(
+            zeroline=True,
+            showgrid=True,
+            scaleanchor="x",
+            scaleratio=1,
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+    )
+
+    return fig
+def _pf_frame_diagram(
+    df_nodes: pd.DataFrame,
+    df_el: pd.DataFrame,
+    df_sup: pd.DataFrame,
+    result_pf,
+    diagram_type: str,
+    title: str,
+) -> go.Figure:
+    """
+    Ve noi luc (M/V/N) TRUC TIEP TREN HINH KHUNG PHANG - dung phong cach
+    phan mem ket cau chuyen dung (SAP2000/ETABS/RDM...): duong bieu do
+    duoc ve vuong goc voi truc thanh, lech sang mot ben theo dau gia tri,
+    co gach hatch va ghi tri so tai 2 dau + diem cuc tri, thay vi ve theo
+    truc hoanh/tung do rieng (khong con "Normalized Element Coordinate").
+
+    Quy uoc: chieu lech (ben nao cua thanh) chi phan anh DAU cua gia tri
+    noi luc theo he truc cuc bo cua phan tu trong lien ket voi solver hien
+    tai — chua doi chieu theo "tho chiu keo" nhu quy uoc ve tay truyen
+    thong. Tri so tuyet doi va vi tri cuc tri la chinh xac tu ket qua FEM.
+    """
+
+    fig = go.Figure()
+
+    diagram_type = str(diagram_type).strip().lower()
+    attr_map = {
+        "moment": ("moment", COLOR_BMD),
+        "shear": ("shear", COLOR_SFD),
+        "axial": ("axial", "#168f2c"),
+    }
+    if diagram_type not in attr_map:
+        fig.update_layout(title=f"{title} — Loại biểu đồ không hợp lệ", template="plotly_white", height=460)
+        return fig
+    data_attr, diag_color = attr_map[diagram_type]
+
+    if df_nodes is None or df_nodes.empty:
+        fig.update_layout(title=title, template="plotly_white", height=460)
+        return fig
+
+    nodes = df_nodes.copy()
+    if not all(c in nodes.columns for c in ["x (m)", "y (m)"]):
+        fig.update_layout(title=title, template="plotly_white", height=460)
+        return fig
+    nodes["x (m)"] = pd.to_numeric(nodes["x (m)"], errors="coerce")
+    nodes["y (m)"] = pd.to_numeric(nodes["y (m)"], errors="coerce")
+    nodes = nodes.dropna(subset=["x (m)", "y (m)"]).reset_index(drop=True)
+
+    # ---------------------------------------------------------------
+    # 1. VE KHUNG NEN (net manh, mau xam den) lam khung tham chieu
+    # ---------------------------------------------------------------
+    if df_el is not None and not df_el.empty and "i" in df_el.columns and "j" in df_el.columns:
+        for _, row in df_el.iterrows():
+            try:
+                i, j = int(row["i"]), int(row["j"])
+                if i < 0 or j < 0 or i >= len(nodes) or j >= len(nodes):
+                    continue
+                xi, yi = float(nodes.loc[i, "x (m)"]), float(nodes.loc[i, "y (m)"])
+                xj, yj = float(nodes.loc[j, "x (m)"]), float(nodes.loc[j, "y (m)"])
+                fig.add_trace(go.Scatter(
+                    x=[xi, xj], y=[yi, yj], mode="lines",
+                    line=dict(color="#eef3fb", width=5),
+                    hoverinfo="skip", showlegend=False,
+                ))
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+
+    if df_sup is not None and not df_sup.empty and "node" in df_sup.columns:
+        # Kích thước ký hiệu gối đồng bộ với _pf_geometry_plot / các tab dầm
+        x_span_sup = float(nodes["x (m)"].max() - nodes["x (m)"].min()) if len(nodes) else 0.0
+        y_span_sup = float(nodes["y (m)"].max() - nodes["y (m)"].min()) if len(nodes) else 0.0
+        sup_size = max(max(x_span_sup, y_span_sup) * 0.035, 0.25)
+
+        for _, row in df_sup.iterrows():
+            try:
+                node_id = int(row["node"])
+                if node_id < 0 or node_id >= len(nodes):
+                    continue
+                x = float(nodes.loc[node_id, "x (m)"]); y = float(nodes.loc[node_id, "y (m)"])
+                sup_type = _pf_support_type(row)
+                draw_support_pf(fig, x, y, sup_type, sup_size)
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+
+    if result_pf is None:
+        fig.update_layout(
+            title=f"{title} — Chưa có kết quả", template="plotly_white", height=460,
+            xaxis_title="X (m)", yaxis_title="Y (m)",
+            yaxis=dict(scaleanchor="x", scaleratio=1),
+        )
+        return fig
+
+    element_results = getattr(result_pf, "element_results", None)
+    if not element_results:
+        fig.update_layout(
+            title=f"{title} — Không có dữ liệu", template="plotly_white", height=460,
+            xaxis_title="X (m)", yaxis_title="Y (m)",
+            yaxis=dict(scaleanchor="x", scaleratio=1),
+        )
+        return fig
+
+    # ---------------------------------------------------------------
+    # 2. TIM HE SO TY LE CHUNG (dung 1 ty le cho toan bo khung, giong
+    #    cach cac phan mem ket cau ve dong bo giua cac phan tu)
+    # ---------------------------------------------------------------
+    all_vals = []
+    for er in element_results:
+        v = getattr(er, data_attr, None)
+        if v is None:
+            continue
+        try:
+            v = np.asarray(v, dtype=float).flatten()
+        except Exception:
+            continue
+        if v.size:
+            all_vals.append(v)
+
+    if not all_vals:
+        fig.add_annotation(text=f"Không tìm thấy dữ liệu {diagram_type} trong kết quả FEM.",
+                            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font=dict(size=13))
+        fig.update_layout(title=title, template="plotly_white", height=460)
+        return fig
+
+    max_abs = max(float(np.max(np.abs(v))) for v in all_vals)
+
+    x_span = float(nodes["x (m)"].max() - nodes["x (m)"].min()) if len(nodes) else 0.0
+    y_span = float(nodes["y (m)"].max() - nodes["y (m)"].min()) if len(nodes) else 0.0
+    frame_extent = max(x_span, y_span, 1.0)
+    scale = (frame_extent * 0.22 / max_abs) if max_abs > 1e-9 else 0.0
+
+    # ---------------------------------------------------------------
+    # 3. VE BIEU DO NOI LUC LECH VUONG GOC TRUC THANH (hatch + duong bao)
+    # ---------------------------------------------------------------
+    hatch_x, hatch_y = [], []
+    ann_seen = set()
+
+    for e_id, er in enumerate(element_results):
+        values = getattr(er, data_attr, None)
+        xg = getattr(er, "x_coords", None)
+        yg = getattr(er, "y_coords", None)
+        if values is None or xg is None or yg is None:
+            continue
+        try:
+            values = np.asarray(values, dtype=float).flatten()
+            xg = np.asarray(xg, dtype=float).flatten()
+            yg = np.asarray(yg, dtype=float).flatten()
+        except Exception:
+            continue
+        n = min(len(values), len(xg), len(yg))
+        if n < 2:
+            continue
+        values, xg, yg = values[:n], xg[:n], yg[:n]
+
+        dx, dy = xg[-1] - xg[0], yg[-1] - yg[0]
+        L = math.hypot(dx, dy)
+        if L < 1e-9:
+            continue
+        tx, ty = dx / L, dy / L
+        nx, ny = -ty, tx  # phap tuyen, quay 90 deg nguoc kim dong ho tu truc doc thanh
+
+        ox = xg + values * scale * nx
+        oy = yg + values * scale * ny
+
+        for k in range(n):
+            hatch_x.extend([xg[k], ox[k], None])
+            hatch_y.extend([yg[k], oy[k], None])
+
+        fig.add_trace(go.Scatter(
+            x=ox, y=oy, mode="lines",
+            line=dict(color=diag_color, width=2.4),
+            name=f"E{e_id}",
+            hovertemplate=f"E{e_id}<br>{title} = %{{customdata:.3f}}<extra></extra>",
+            customdata=values,
+            showlegend=False,
+        ))
+
+        # Nhan tri so tai 2 dau phan tu (tranh trung lap qua nhieu tai cung 1 node)
+        for k, label_pos in [(0, "start"), (n - 1, "end")]:
+            key = (round(xg[k], 4), round(yg[k], 4), round(values[k], 4))
+            if key in ann_seen:
+                continue
+            ann_seen.add(key)
+            if abs(values[k]) < 1e-6:
+                continue
+            fig.add_annotation(
+                x=ox[k], y=oy[k], text=f"{values[k]:.3g}",
+                showarrow=False, font=dict(size=10, color=diag_color),
+                bgcolor="rgba(255,255,255,0.75)",
+            )
+
+        # Nhan gia tri cuc tri trong long phan tu (khong phai 2 dau)
+        idx_ext = int(np.argmax(np.abs(values)))
+        if 0 < idx_ext < n - 1 and abs(values[idx_ext]) > 1e-6:
+            fig.add_annotation(
+                x=ox[idx_ext], y=oy[idx_ext], text=f"{values[idx_ext]:.3g}",
+                showarrow=False, font=dict(size=10, color=diag_color),
+                bgcolor="rgba(255,255,255,0.75)",
+            )
+
+    if hatch_x:
+        fig.add_trace(go.Scatter(
+            x=hatch_x, y=hatch_y, mode="lines",
+            line=dict(color=diag_color, width=0.8),
+            opacity=0.55, hoverinfo="skip", showlegend=False,
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        template="plotly_white",
+        height=460,
+        margin=dict(l=50, r=30, t=60, b=50),
+        xaxis=dict(zeroline=True, showgrid=True),
+        yaxis=dict(zeroline=True, showgrid=True, scaleanchor="x", scaleratio=1),
+        showlegend=False,
+    )
+
+    return fig
+
+# ══════════════════════════════════════════════════════
+#  MAIN RUNNER
+# ══════════════════════════════════════════════════════
+def main():
+    # Khởi tạo trạng thái sidebar lần đầu
+    if "sidebar_open" not in st.session_state:
+        st.session_state.sidebar_open = True
+
+    inject_css()
+
+    # ════════════════════════════════════════════════════════════
+    # 🔥 ĐOẠN CSS VÁ LỖI: TRÁNH CHE KHUẤT LOGO & TIÊU ĐỀ TRÊN CÙNG 🔥
+    # ════════════════════════════════════════════════════════════
+    st.markdown("""
+        <style>
+        /* 1. Ẩn thanh header mặc định của Streamlit để không tranh chấp vị trí đè lên chữ */
+        [data-testid="stHeader"] {
+            display: none !important;
+        }
+        /* 2. Định nghĩa khoảng cách đỉnh đầu an toàn giúp tiêu đề cách mép trên một khoảng vừa vặn */
+        .block-container {
+            padding-top: 2rem !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    # ════════════════════════════════════════════════════════════
+
+    # ── Header row: Nút ☰ nằm bên trái, Logo và Tiêu đề nằm ở giữa ──────────────────
+    header_col1, header_col2, header_col3 = st.columns([0.05, 0.90, 0.05], vertical_alignment="center")
+
+    with header_col1:
+        # Nút taskbar (☰) nằm sát lề trái, thẳng hàng hoàn hảo với các tab bên dưới
+        icon = "☰"
+        if st.button(icon, key="toggle_sidebar", help="Mở/đóng bảng nhập liệu"):
+            st.session_state.sidebar_open = not st.session_state.sidebar_open
+            st.rerun()
+
+    with header_col2:
+        # Khối giữa chứa Logo và Tiêu đề được căn giữa tuyệt đối
+        st.markdown(
+            """
+            <div style="
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 25px;
+                width: 100%;
+            ">
+            """,
+            unsafe_allow_html=True
+        )
+
+        logo_sub_col, text_sub_col = st.columns([0.15, 0.85], vertical_alignment="center")
+
+        with logo_sub_col:
+            # Tăng kích thước logo to rõ (width=135)
+            st.image("LOGO/TOOLBOX.png", width=135)
+
+        with text_sub_col:
+            # Tiêu đề to bản, sắc nét và chuyên nghiệp
+            st.markdown(
+                """
+                <div style="
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: center;
+                ">
+                    <div style="
+                        font-size: 32px;
+                        font-weight: 800;
+                        letter-spacing: 0.5px;
+                        line-height: 1.2;
+                        background: linear-gradient(90deg, #ffffff, #b0c4de);
+                        -webkit-background-clip: text;
+                        -webkit-text-fill-color: transparent;
+                    ">
+                        BEAM ANALYSIS TOOLBOX
+                    </div>
+                    <div style="
+                        font-size: 15px;
+                        opacity: 0.75;
+                        margin-top: 5px;
+                        font-weight: 400;
+                        letter-spacing: 0.3px;
+                    ">
+                        Simplified Structural Analysis Tool
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Đường kẻ ngang phân tách header thanh lịch
+    st.markdown("<hr style='margin-top: 10px; margin-bottom: 25px; border-color: rgba(255,255,255,0.1);'>",
+                unsafe_allow_html=True)
+    # ── Tabs ──────────────────────────────────────────
+    # Thêm tab "Feedback" vào danh sách
+    tab1, tab2, tab3, tab4 = st.tabs(["Single Beam", "Continuous Beam", "Plane Frame", "📋 Feedback"])
+    with tab1: render_single_beam()
+    with tab2: render_continuous_beam()
+    with tab3: render_plane_frame()
+    with tab4:
+        st.title("📋 Đóng góp ý kiến & Báo lỗi")
+        st.info("💡 Tôi luôn lắng nghe ý kiến từ bạn để cải tiến công cụ tốt hơn từng ngày!")
+
+        st.markdown("""
+        **Bạn có thể phản hồi về:**
+        - 🐛 Các lỗi tính toán hoặc lỗi giao diện gặp phải.
+        - 💡 Đề xuất thêm tính năng mới (Ví dụ: tính toán TTGH1, TTGH2,...).
+        - 💬 Trải nghiệm tổng thể của bạn.
+        """)
+
+
+        st.link_button(
+            "🚀 Gửi Feedback Qua Google Form",
+            "https://forms.gle/fm8aSmCyX9LTPPsq9",
+            type="primary",
+            use_container_width=True
+    )
+if __name__ == "__main__":
+    main()
