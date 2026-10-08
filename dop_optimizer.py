@@ -79,7 +79,7 @@ def variational_axial_A(N, x, E, sigma_allow, disp_energy_limit):
     stress_A = Nabs / max(sigma_allow, 1e-12)
 
     def energy(A):
-        return float(np.trapz(Nabs**2 / np.maximum(E*A, 1e-18), x))
+        return float(np.trapezoid(Nabs**2 / np.maximum(E*A, 1e-18), x))
 
     if energy(stress_A) <= disp_energy_limit:
         return stress_A, 0.0
@@ -120,8 +120,8 @@ def variational_frame_candidate(result, elements, settings: OptimizationSettings
         L = max(q["L"], 1e-12)
         A = max(float(e["A"]), settings.A_min)
         I = max(float(e["I"]), settings.I_min)
-        current_energy += np.trapz(N**2/(settings.E*A), x)
-        current_energy += np.trapz(M**2/(settings.E*I), x)
+        current_energy += np.trapezoid(N**2/(settings.E*A), x)
+        current_energy += np.trapezoid(M**2/(settings.E*I), x)
 
     ratio = (settings.disp_allow / d0)**2
     energy_limit = current_energy * ratio
@@ -135,7 +135,7 @@ def variational_frame_candidate(result, elements, settings: OptimizationSettings
         L = max(q["L"], 1e-12)
 
         # Allocate element energy budget proportional to its current energy.
-        ce = np.trapz(N**2/(settings.E*A0), x) + np.trapz(M**2/(settings.E*I0), x)
+        ce = np.trapezoid(N**2/(settings.E*A0), x) + np.trapezoid(M**2/(settings.E*I0), x)
         budget = energy_limit * ce / max(current_energy, 1e-18)
 
         # Split between axial and bending terms.
@@ -149,14 +149,14 @@ def variational_frame_candidate(result, elements, settings: OptimizationSettings
         # For a rectangular-family proxy I ∝ A^2, but keep I bounded here.
         # The bending variational stationarity gives I*(x) ∝ |M(x)|.
         if np.max(Mabs) > 0:
-            scale = bI / max(float(np.trapz(Mabs**2/(settings.E*np.maximum(I0,1e-18)), x)), 1e-18)
+            scale = bI / max(float(np.trapezoid(Mabs**2/(settings.E*np.maximum(I0,1e-18)), x)), 1e-18)
             Istar = np.maximum(settings.I_min, I0 * np.sqrt(max(scale, 1e-12)))
             Istar *= np.clip(Mabs / max(np.max(Mabs), 1e-18), 0.25, 1.0)
         else:
             Istar = np.full_like(x, I0)
 
-        Abar = float(np.trapz(Astar, x)/L)
-        Ibar = float(np.trapz(Istar, x)/L)
+        Abar = float(np.trapezoid(Astar, x)/L)
+        Ibar = float(np.trapezoid(Istar, x)/L)
         candidates.append((np.clip(Abar, settings.A_min, settings.A_max),
                           np.clip(Ibar, settings.I_min, settings.I_max)))
         lambdas.append(lamA)
