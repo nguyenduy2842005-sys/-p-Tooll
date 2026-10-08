@@ -5,5 +5,5 @@ pandas
 plotly
 matplotlib
 python-docx
-st-aggrid
+streamlit-aggrid
 kaleido
