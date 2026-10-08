@@ -227,15 +227,43 @@ def render_optimizer():
 
     out=st.session_state.get("dop_opt")
     if out:
-        st.markdown("### 3. Phân tích lại sau tối ưu")
-        a,b,c=st.columns(3)
-        a.metric("V thép trước",f"{out['objective_initial']:.6g} m³")
-        b.metric("V thép sau",f"{out['objective_final']:.6g} m³")
-        c.metric("Chuyển vị sau",f"{out['d_final']*1000:.4f} mm")
-        if out["success"]: st.success(out["message"])
-        else: st.warning(out["message"])
+        st.markdown("### 3. Kết quả sau tối ưu & hậu kiểm FEM")
+        st.caption("Tiết diện sau tối ưu được đưa trở lại mô hình FEM để cập nhật tự trọng, nội lực và chuyển vị trước khi kết luận.")
+
+        v0=float(out.get("objective_initial",0.0))
+        v1=float(out.get("objective_final",0.0))
+        d1=float(out.get("d_final",0.0))*1000.0
+        dlim_mm=float(settings.disp_allow)*1000.0
+        saving=(1.0-v1/v0)*100.0 if v0>0 else 0.0
+
+        # Kết luận chính — ưu tiên cho người dùng, chi tiết kỹ thuật đưa xuống expander.
+        if out.get("success"):
+            st.success("✅ Tối ưu hội tụ. Tiết diện mới đã được **hậu kiểm bằng FEM**.")
+        else:
+            st.warning("⚠️ Bộ tối ưu chưa hội tụ hoàn toàn. Không nên xem kết quả là tiết diện cuối cùng cho đến khi kiểm tra lại các ràng buộc.")
+
+        a,b,c,d=st.columns(4)
+        a.metric("Thể tích thép trước",f"{v0:.4g} m³")
+        b.metric("Thể tích thép sau",f"{v1:.4g} m³",delta=f"{saving:.1f}%",delta_color="normal")
+        c.metric("Chuyển vị cuối",f"{d1:.4f} mm",delta=f"Giới hạn {dlim_mm:.1f} mm",delta_color="off")
+        d.metric("Trạng thái FEM","Đã hậu kiểm" if out.get("opt_result") is not None else "Chưa hậu kiểm")
+
+        # Thanh tiến trình trực quan cho chuyển vị.
+        disp_ratio=d1/dlim_mm if dlim_mm>0 else 0.0
+        disp_ratio=max(0.0,min(disp_ratio,1.0))
+        st.markdown("**Mức sử dụng giới hạn chuyển vị**")
+        st.progress(disp_ratio, text=f"{d1:.4f} / {dlim_mm:.1f} mm  ·  {disp_ratio*100:.1f}%")
+
         if out.get("self_weight_included"):
-            st.success("Đã **phân tích lại FEM sau tối ưu** với A mới và tự trọng mới; N, M và chuyển vị cuối cùng đã được cập nhật.")
+            st.info("⚖️ **Đã tính lại tự trọng:** A của tiết diện đã thay đổi → tự trọng thay đổi → FEM được chạy lại → N, M và chuyển vị cuối cùng được cập nhật.")
+        else:
+            st.info("ℹ️ Hậu kiểm FEM đã thực hiện, nhưng tùy chọn tự trọng đang tắt.")
+
+        with st.expander("🔎 Xem chi tiết thuật toán và trạng thái tối ưu", expanded=False):
+            st.write("**Thuật toán:** FEM → ứng viên biến phân → tối ưu số có ràng buộc → cập nhật A, I → FEM hậu kiểm → KKT.")
+            st.write(f"**Trạng thái bộ tối ưu:** {out.get('message','Không có thông báo.')}")
+            st.write(f"**Tiết kiệm thể tích thép:** {saving:.2f}%")
+            st.write(f"**Chuyển vị hậu kiểm:** {d1:.4f} mm / {dlim_mm:.4f} mm")
 
         rdf=pd.DataFrame({
             "Thanh":range(len(out["A_final"])),
